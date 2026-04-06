@@ -1,0 +1,8 @@
+// license:BSD-3-Clause
+// copyright-holders:Mark Murray
+//
+// Driver list for the llvm6309 subtarget — a minimal HD6309 SBC used to
+// validate the llvm-mc6809 backend.
+
+@source:homebrew/llvm6309.cpp
+llvm6309
