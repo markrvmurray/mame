@@ -47,12 +47,29 @@ MACHINES["ACIA6850"] = true
 
 
 --------------------------------------------------
--- Buses: RS232 for the serial console slot, and
--- GENERIC for the runtime cartridge slot that
--- feeds `-cart file.bin` into the 8K ROM region.
+-- Buses:
+--
+--   GENERIC is enabled normally — used by the runtime cartridge slot that
+--   feeds `-cart file.bin` into the 8K ROM region.
+--
+--   RS232 is intentionally NOT enabled. If it were, bus.lua would compile
+--   every rs232 card (heath_h19, ie15, mboardd, scorpion, sun_kbd, swtpc8212,
+--   terminal, votraxtnt, ...) into liboptional.a, and rs232.cpp's
+--   default_rs232_devices() function would drag all of them into the final
+--   link via hard references — pulling in transitive dependencies on
+--   beep_device, ay8910, mc6845, m6800/m6801, and more. We only need the
+--   bus core plus null_modem, so:
+--
+--     - llvm6309_rs232_core.cpp (below) is a local stripped copy of
+--       src/devices/bus/rs232/rs232.cpp without the terminal includes or
+--       default_rs232_devices(), providing just the bus class symbols.
+--     - null_modem.cpp is compiled directly into this subtarget's driver
+--       library (it only depends on imagedev/bitbngr which is already in
+--       machine.lua's unconditional section).
+--   The driver defines its own minimal rs232 slot-option function
+--   (llvm6309_rs232_devices) so it never calls default_rs232_devices().
 --------------------------------------------------
 
-BUSES["RS232"] = true
 BUSES["GENERIC"] = true
 
 
@@ -83,6 +100,13 @@ function createProjects_mame_llvm6309(_target, _subtarget)
 
 	files {
 		MAME_DIR .. "src/mame/homebrew/llvm6309.cpp",
+		-- Local stripped rs232 bus core — replaces src/devices/bus/rs232/rs232.cpp,
+		-- which is not compiled because BUSES["RS232"] is not set.
+		MAME_DIR .. "src/mame/homebrew/llvm6309_rs232_core.cpp",
+		-- null_modem is the only rs232 card we actually use; compiled here so
+		-- it does not pull in the full rs232 card zoo via liboptional.a.
+		MAME_DIR .. "src/devices/bus/rs232/null_modem.cpp",
+		MAME_DIR .. "src/devices/bus/rs232/null_modem.h",
 	}
 end
 

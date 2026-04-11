@@ -37,6 +37,7 @@
 #include "bus/generic/carts.h"
 #include "bus/generic/slot.h"
 #include "bus/rs232/rs232.h"
+#include "bus/rs232/null_modem.h"
 #include "cpu/m6809/hd6309.h"
 #include "machine/6850acia.h"
 #include "machine/clock.h"
@@ -56,19 +57,52 @@ public:
 
 	void llvm6309(machine_config &config);
 
+protected:
+	virtual void machine_start() override ATTR_COLD;
+
 private:
 	void mem_map(address_map &map) ATTR_COLD;
 	void exit_w(u8 data);
+	TIMER_CALLBACK_MEMBER(do_exit);
+	std::pair<std::error_condition, std::string> load_cart(device_image_interface &image);
 
 	required_device<hd6309_device> m_maincpu;
 	required_device<acia6850_device> m_acia;
 	required_device<generic_slot_device> m_cart;
+	emu_timer *m_exit_timer = nullptr;
 };
+
+void llvm6309_state::machine_start()
+{
+	m_exit_timer = timer_alloc(FUNC(llvm6309_state::do_exit), this);
+}
 
 void llvm6309_state::exit_w(u8 data)
 {
-	// Any write here ends the emulation run cleanly.
+	// Any write here ends the emulation run cleanly. The actual exit is
+	// deferred by ~2 ms so any byte still being shifted out of the ACIA's
+	// TX shift register has time to reach the null_modem / bitbanger
+	// before MAME tears down. Without this, the last character of the
+	// output would be silently dropped.
+	m_exit_timer->adjust(attotime::from_msec(2));
+}
+
+TIMER_CALLBACK_MEMBER(llvm6309_state::do_exit)
+{
 	machine().schedule_exit();
+}
+
+std::pair<std::error_condition, std::string> llvm6309_state::load_cart(device_image_interface &image)
+{
+	generic_slot_device &slot = downcast<generic_slot_device &>(image.device());
+	u32 size = slot.common_get_size("rom");
+	if (size == 0)
+		return std::make_pair(image_error::INVALIDLENGTH, "Empty cartridge image");
+	if (size > 0x2000)
+		return std::make_pair(image_error::INVALIDLENGTH, "Cartridge image must be no larger than 8K");
+	slot.rom_alloc(0x2000, GENERIC_ROM8_WIDTH, ENDIANNESS_BIG);
+	slot.common_load_rom(slot.get_rom_base(), size, "rom");
+	return std::make_pair(std::error_condition(), std::string());
 }
 
 void llvm6309_state::mem_map(address_map &map)
@@ -81,15 +115,29 @@ void llvm6309_state::mem_map(address_map &map)
 	map(0xe002, 0xe002).w(FUNC(llvm6309_state::exit_w));
 }
 
-// Host-side defaults for the RS232 terminal option (used if someone runs
-// with `-rs232 terminal` for interactive poking instead of null_modem).
-static DEVICE_INPUT_DEFAULTS_START( terminal )
+// null_modem defaults to 9600 baud. Our ACIA drives at 115200, so the
+// null_modem's device_serial_interface would bit-decode garbage unless
+// we match the rates. Override its input-port defaults here.
+static DEVICE_INPUT_DEFAULTS_START( null_modem )
 	DEVICE_INPUT_DEFAULTS( "RS232_RXBAUD",   0xff, RS232_BAUD_115200 )
 	DEVICE_INPUT_DEFAULTS( "RS232_TXBAUD",   0xff, RS232_BAUD_115200 )
 	DEVICE_INPUT_DEFAULTS( "RS232_DATABITS", 0xff, RS232_DATABITS_8 )
 	DEVICE_INPUT_DEFAULTS( "RS232_PARITY",   0xff, RS232_PARITY_NONE )
 	DEVICE_INPUT_DEFAULTS( "RS232_STOPBITS", 0xff, RS232_STOPBITS_1 )
 DEVICE_INPUT_DEFAULTS_END
+
+// Minimal RS232 slot option set — only null_modem. `default_rs232_devices`
+// from bus/rs232/rs232.cpp pulls in every emulated terminal card (h19, ie15,
+// swtpc8212, sun_kbd, votraxtnt, ...) which in turn reference video/sound/CPU
+// devices we don't want in this subtarget, so we roll our own list. The
+// subtarget build (see scripts/target/mame/llvm6309.lua) does not compile
+// bus/rs232/rs232.cpp at all — a local stripped copy in
+// llvm6309_rs232_core.cpp provides the bus core symbols without
+// default_rs232_devices().
+static void llvm6309_rs232_devices(device_slot_interface &device)
+{
+	device.option_add("null_modem", NULL_MODEM);   // TX → -bitb file (FileCheck)
+}
 
 void llvm6309_state::llvm6309(machine_config &config)
 {
@@ -107,26 +155,15 @@ void llvm6309_state::llvm6309(machine_config &config)
 	acia_clock.signal_handler().append(m_acia, FUNC(acia6850_device::write_rxc));
 
 	// RS232 slot — default to null_modem so `-bitb /path/to/out` works out
-	// of the box for lit execution tests. Override with e.g. `-rs232 terminal`
-	// for an interactive window, or `-rs232 pty` for a pseudo-terminal.
-	rs232_port_device &rs232(RS232_PORT(config, "rs232", default_rs232_devices, "null_modem"));
+	// of the box for lit execution tests. Available options are limited to
+	// null_modem / pty / loopback via llvm6309_rs232_devices above.
+	rs232_port_device &rs232(RS232_PORT(config, "rs232", llvm6309_rs232_devices, "null_modem"));
 	rs232.rxd_handler().set(m_acia, FUNC(acia6850_device::write_rxd));
-	rs232.set_option_device_input_defaults("terminal", DEVICE_INPUT_DEFAULTS_NAME(terminal));
+	rs232.set_option_device_input_defaults("null_modem", DEVICE_INPUT_DEFAULTS_NAME(null_modem));
 
 	// 8K ROM via generic cart slot — pass with `-cart file.bin`.
 	GENERIC_SOCKET(config, m_cart, generic_plain_slot, "llvm6309_rom", "bin,rom");
-	m_cart->set_device_load(NAME([] (device_image_interface &image) -> std::pair<std::error_condition, std::string>
-	{
-		generic_slot_device &slot = downcast<generic_slot_device &>(image.device());
-		u32 size = slot.common_get_size("rom");
-		if (size == 0)
-			return std::make_pair(image_error::INVALIDLENGTH, "Empty cartridge image");
-		if (size > 0x2000)
-			return std::make_pair(image_error::INVALIDLENGTH, "Cartridge image must be no larger than 8K");
-		slot.rom_alloc(0x2000, GENERIC_ROM8_WIDTH, ENDIANNESS_BIG);
-		slot.common_load_rom(slot.get_rom_base(), size, "rom");
-		return std::make_pair(std::error_condition(), std::string());
-	}));
+	m_cart->set_device_load(FUNC(llvm6309_state::load_cart));
 	m_cart->set_must_be_loaded(true);
 }
 
