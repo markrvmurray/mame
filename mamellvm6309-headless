@@ -1,0 +1,43 @@
+#!/bin/sh
+# license:BSD-3-Clause
+# copyright-holders:Mark Murray
+#
+# Wrapper that runs the llvm6309 subtarget binary fully headlessly on macOS.
+#
+# Combines the three knobs that together suppress all visual / focus side
+# effects of MAME's SDL3 OSD:
+#
+#   SDL_VIDEO_DRIVER=dummy   SDL3 creates SDL_Window objects backed by nothing
+#                            (no NSWindow, no Cocoa activation, no focus steal)
+#   -video none              MAME's drawnone renderer — no GPU / OpenGL context
+#   -sound none              skip CoreAudio init (and its "couldn't get size of
+#                            layout" warnings)
+#   -window -nothrottle      no fullscreen, no frame-rate cap
+#
+# Any arguments passed to this wrapper are forwarded after the fixed flags,
+# so MAME's option parser applies them (and lets you override any of the
+# fixed defaults — later wins).
+#
+# Typical invocation:
+#
+#   : > /tmp/out.txt
+#   ./mamellvm6309-headless \
+#       -rom /path/to/test.bin \
+#       -rs232 null_modem -bitb /tmp/out.txt \
+#       -seconds_to_run 2
+#   FileCheck %s < /tmp/out.txt
+#
+# Note: the bitbanger output file must already exist (empty is fine). MAME's
+# bitbanger device opens it via image::exists() and refuses to create a new
+# file. Pre-create with `: > /tmp/out.txt` or `touch`.
+
+set -e
+
+here=$(dirname "$0")
+exec env SDL_VIDEO_DRIVER=dummy \
+    "${here}/mamellvm6309" llvm6309 \
+        -video none \
+        -sound none \
+        -window \
+        -nothrottle \
+        "$@"

@@ -108,17 +108,51 @@ make SUBTARGET=llvm6309 REGENIE=1 -j$(sysctl -n hw.ncpu)
 
 ### Running tests
 
-Canonical lit-friendly invocation — cart file in, serial output to file,
-auto-exit, output captured by FileCheck:
+**Use the `mamellvm6309-headless` wrapper** for lit-friendly runs on macOS —
+it combines `SDL_VIDEO_DRIVER=dummy` with `-video none -sound none` so MAME
+produces no window, no focus steal, no audio side effects, and no
+CoreAudio warnings. Output capture still works, everything else is
+unchanged.
 
 ```sh
 : > /tmp/out.txt                     # IMPORTANT: pre-create empty file, see below
-./mamellvm6309 llvm6309 \
+./mamellvm6309-headless \
     -rom /path/to/test.bin \
     -rs232 null_modem -bitb /tmp/out.txt \
-    -window -nothrottle -seconds_to_run 2
+    -seconds_to_run 2
 FileCheck %s < /tmp/out.txt
 ```
+
+The wrapper sets `SDL_VIDEO_DRIVER=dummy` in the environment before exec'ing
+`./mamellvm6309`, and forwards `-video none -sound none -window -nothrottle`
+plus the driver name `llvm6309` automatically. Your arguments are appended
+after those, so MAME's option parser lets you override any of them if
+needed (later wins).
+
+If you really want to see the UI (for interactive poking) run
+`./mamellvm6309` directly without the wrapper. That uses the full SDL3 OSD
+with a visible window.
+
+#### Why all three knobs are needed on macOS
+
+- **`SDL_VIDEO_DRIVER=dummy`** makes SDL3 use its null video driver. SDL
+  still constructs `SDL_Window` objects, but they are backed by nothing — no
+  `NSWindow`, no Cocoa activation, no focus steal. Without this, MAME's
+  SDL3 OSD always creates a real Cocoa window regardless of `-nowindow`.
+- **`-video none`** selects MAME's `drawnone` renderer. With
+  `SDL_VIDEO_DRIVER=dummy`, SDL's OpenGL context creation fails, so MAME's
+  default OpenGL renderer errors out ("OpenGL support is either not
+  configured in SDL or not available in current SDL video driver (dummy)").
+  `-video none` sidesteps renderer initialisation entirely.
+- **`-sound none`** suppresses CoreAudio init. Without it, every run prints
+  `CoreAudio: couldn't get size of layout 2003332927` twice on startup.
+  Doesn't affect correctness, but the warnings are noisy in lit output.
+- **`-window -nothrottle`** — `-window` tells MAME not to go fullscreen (it
+  already isn't, with dummy driver, but the option parser still expects a
+  decision); `-nothrottle` removes the frame-rate cap so emulation runs as
+  fast as the host allows.
+
+#### CLI flag details (what the wrapper forwards)
 
 - **`-rom file.bin`** — the ROM image is loaded through a
   `generic_slot_device`. No hash verification, no ZIP, no `rompath` — just
@@ -130,19 +164,29 @@ FileCheck %s < /tmp/out.txt
   the file does not already exist, load fails with "No such file or directory"
   and no output is captured. `: > /tmp/out.txt` (or `touch`) creates an empty
   file before each run.
-- **`-rs232 null_modem -bitb <path>`** — the driver defaults the RS232 slot
-  to `null_modem`, so `-bitb` captures all serial TX to the file. The driver
-  also overrides the `null_modem` card's input-port defaults to 115200 baud
-  8N1 to match the ACIA clock; without this, the null_modem decodes at its
-  built-in 9600 baud default and produces bit-level garbage.
-- **`-window -nothrottle`** — macOS MAME always wants a window for normal
-  drivers (there's no true `-video none` for non-validation runs). A small
-  window pops up for ~2 seconds per run. `-nothrottle` removes the frame-rate
-  cap so emulation runs as fast as the host allows.
+- **`-rs232 null_modem -bitb <path>`** — the driver restricts the RS232 slot
+  options to `null_modem` only (see the "RS-232 workaround" section above),
+  so this is the only sensible choice. `-bitb` captures all serial TX to the
+  file. The driver also overrides the `null_modem` card's input-port defaults
+  to 115200 baud 8N1 to match the ACIA clock; without that override, the
+  null_modem would decode at its built-in 9600 baud default and produce
+  bit-level garbage.
 - **`-seconds_to_run N`** — safety net for runaway programs. Normal clean
   termination is via the `$E002` exit port — the last instruction of each
   test program stores any value to `$E002` and MAME exits 2 ms later (enough
   time for the ACIA to drain its TX shift register).
+
+#### Performance note (known issue, not yet fixed)
+
+With the headless incantation, each run currently takes ~9 seconds of wall
+time for a program that self-terminates in microseconds of emulated time.
+MAME's startup/teardown plus SDL3 init/quit accounts for the entire gap;
+the actual emulation finishes almost immediately. This is acceptable for
+small test suites but painful for large lit runs. Reducing this is a TODO.
+Options being considered include pruning unused input providers
+(`-keyboardprovider none -mouseprovider none -lightgunprovider none
+-joystickprovider none -debugger none`), and, longer-term, a real
+headless OSD that bypasses SDL3 entirely.
 
 ### Test program skeleton (lwasm)
 

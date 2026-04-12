@@ -41,6 +41,8 @@
 !/*.md
 !/*.bdf
 !/LICENSE
+# MRVM: headless-run wrapper for the llvm6309 subtarget (see README_MRVM.md)
+!/mamellvm6309-headless
 /.idea
 .vscode
 docs/build
