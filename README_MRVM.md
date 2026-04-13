@@ -16,10 +16,10 @@ driver fills that gap.
 
 | Range         | Size     | Device                                                 |
 |---------------|----------|--------------------------------------------------------|
-| `$0000-$DFFF` | 56K      | RAM                                                    |
-| `$E000-$E001` | 2 bytes  | MC6850 ACIA (serial console, polled — no IRQ hookup)   |
-| `$E002`       | 1 byte   | Exit port (write-only; any write → deferred clean exit) |
-| `$E003-$FFFF` | ~8K − 3  | ROM window, backed by a runtime `generic_slot_device`  |
+| `$0000-$BFFF` | 48K      | RAM                                                    |
+| `$C000-$C001` | 2 bytes  | MC6850 ACIA (serial console, polled — no IRQ hookup)   |
+| `$C002`       | 1 byte   | Exit port (write-only; any write → deferred clean exit) |
+| `$C003-$FFFF` | ~16K − 3 | ROM window, backed by a runtime `generic_slot_device`  |
 
 - CPU: Hitachi HD6309 at an 8 MHz crystal (2 MHz E clock). Boots in 6809
   emulation mode — execute `LDMD #1` early to engage native mode.
@@ -29,8 +29,8 @@ driver fills that gap.
   default.
 - The ACIA and exit-port mappings are defined *after* the ROM mapping in the
   same `address_map`, so they overlay the first 3 bytes of the ROM window
-  (later-wins). Your cart binary is a full 8K image; the first 3 bytes are
-  wasted — start your code at `$E010` (or anywhere ≥ `$E003`) and leave those
+  (later-wins). Your cart binary is a full 16K image; the first 3 bytes are
+  wasted — start your code at `$C010` (or anywhere ≥ `$C003`) and leave those
   three bytes as padding.
 - The exit port **defers the actual exit by 2 ms** via a one-shot timer so any
   byte still being shifted out of the ACIA's TX shift register reaches the
@@ -156,7 +156,7 @@ with a visible window.
 
 - **`-rom file.bin`** — the ROM image is loaded through a
   `generic_slot_device`. No hash verification, no ZIP, no `rompath` — just
-  hand it a raw 8K binary. Max size 8K; anything larger is rejected. The CLI
+  hand it a raw 16K binary. Max size 16K; anything larger is rejected. The CLI
   option name is `-rom` (the media name MAME exposes for the cart slot), not
   `-cart`.
 - **`-bitb /tmp/out.txt` requires a pre-existing file.** MAME's bitbanger
@@ -172,38 +172,37 @@ with a visible window.
   null_modem would decode at its built-in 9600 baud default and produce
   bit-level garbage.
 - **`-seconds_to_run N`** — safety net for runaway programs. Normal clean
-  termination is via the `$E002` exit port — the last instruction of each
-  test program stores any value to `$E002` and MAME exits 2 ms later (enough
+  termination is via the `$C002` exit port — the last instruction of each
+  test program stores any value to `$C002` and MAME exits 2 ms later (enough
   time for the ACIA to drain its TX shift register).
 
-#### Performance note (known issue, not yet fixed)
+#### Performance note
 
-With the headless incantation, each run currently takes ~9 seconds of wall
-time for a program that self-terminates in microseconds of emulated time.
-MAME's startup/teardown plus SDL3 init/quit accounts for the entire gap;
-the actual emulation finishes almost immediately. This is acceptable for
-small test suites but painful for large lit runs. Reducing this is a TODO.
-Options being considered include pruning unused input providers
-(`-keyboardprovider none -mouseprovider none -lightgunprovider none
--joystickprovider none -debugger none`), and, longer-term, a real
-headless OSD that bypasses SDL3 entirely.
+With the headless wrapper, each run takes ~1 second of wall time. The
+actual emulation finishes in microseconds; the remaining overhead is
+MAME core init/teardown and SDL3 init/quit. The biggest single win was
+disabling the MIDI provider (`-midiprovider none`) — PortMidi's
+`Pm_Initialize` makes a synchronous XPC call to the CoreMIDI server
+that blocked for 3+ seconds on macOS. Disabling all input providers
+(`-keyboardprovider none`, etc.), plugins, font enumeration, and the
+debugger module shaved another second.
 
 ### Test program skeleton (lwasm)
 
 Verified working minimal program — prints `Hello from HD6309\r\n` and exits:
 
 ```asm
-ACIA_STATUS     equ     $e000
-ACIA_DATA       equ     $e001
-EXIT_PORT       equ     $e002
+ACIA_STATUS     equ     $c000
+ACIA_DATA       equ     $c001
+EXIT_PORT       equ     $c002
 TDRE            equ     $02
 
-                org     $e000
+                org     $c000
                 fcb     0,0,0           ; overlaid by ACIA + exit port
 
-                org     $e010
+                org     $c010
 reset           ldmd    #1              ; 6309 native mode (6309-only insn)
-                lds     #$dfff
+                lds     #$bfff
                 lda     #$03            ; 6850 master reset
                 sta     ACIA_STATUS
                 lda     #$15            ; /16, 8N1, no IRQ
@@ -228,27 +227,27 @@ message         fcc     "Hello from HD6309"
                 fdb     reset
 ```
 
-Assemble and slice the bottom 8K off the full 64K image:
+Assemble and slice the bottom 16K off the full 64K image:
 
 ```sh
 lwasm --format=rawrel --6309 --output=test.full test.asm
-tail -c 8192 test.full > test.bin
+tail -c 16384 test.full > test.bin
 ```
 
 The `--format=rawrel` note is important: plain `--format=raw` does not handle
 the forward `org $fffe` for the reset vector and produces a truncated file.
-`rawrel` emits the entire 64K space; `tail -c 8192` keeps only the ROM window
-at `$E000-$FFFF`.
+`rawrel` emits the entire 64K space; `tail -c 16384` keeps only the ROM window
+at `$C000-$FFFF`.
 
 ### Caveats / gotchas
 
 - **The MC6850 ACIA must be initialised** — master reset (`$03` to control)
   then configure (`$15` for /16 8N1 no-IRQ). Without this, TDRE never
   asserts and the test program loops forever.
-- **3 bytes of ROM are unreachable** (`$E000-$E002`) because the ACIA and
+- **3 bytes of ROM are unreachable** (`$C000-$C002`) because the ACIA and
   exit port overlay them. Don't put code or data there.
 - **ACIA is polled only** — no IRQ line wired from the ACIA to the CPU.
-  Test programs must poll TDRE/RDRF on `$E000`.
+  Test programs must poll TDRE/RDRF on `$C000`.
 - **HD6309 native-mode switch** — the CPU boots in 6809-compatible mode.
   Use `LDMD #1` to enable the extra registers (E, F, V, W/Q) and 6309
   instructions.

@@ -2,42 +2,58 @@
 # license:BSD-3-Clause
 # copyright-holders:Mark Murray
 #
-# Wrapper that runs the llvm6309 subtarget binary fully headlessly on macOS.
+# Headless wrapper for the llvm6309 subtarget on macOS.
 #
-# Combines the three knobs that together suppress all visual / focus side
-# effects of MAME's SDL3 OSD:
+# Usage:
+#   ./mamellvm6309-headless <rom-image> [timeout-seconds]
 #
-#   SDL_VIDEO_DRIVER=dummy   SDL3 creates SDL_Window objects backed by nothing
-#                            (no NSWindow, no Cocoa activation, no focus steal)
-#   -video none              MAME's drawnone renderer — no GPU / OpenGL context
-#   -sound none              skip CoreAudio init (and its "couldn't get size of
-#                            layout" warnings)
-#   -window -nothrottle      no fullscreen, no frame-rate cap
+# Serial output goes to stdout. The value written to the exit port ($C002)
+# becomes the process exit code (0-255).
 #
-# Any arguments passed to this wrapper are forwarded after the fixed flags,
-# so MAME's option parser applies them (and lets you override any of the
-# fixed defaults — later wins).
-#
-# Typical invocation:
-#
-#   : > /tmp/out.txt
-#   ./mamellvm6309-headless \
-#       -rom /path/to/test.bin \
-#       -rs232 null_modem -bitb /tmp/out.txt \
-#       -seconds_to_run 2
-#   FileCheck %s < /tmp/out.txt
-#
-# Note: the bitbanger output file must already exist (empty is fine). MAME's
-# bitbanger device opens it via image::exists() and refuses to create a new
-# file. Pre-create with `: > /tmp/out.txt` or `touch`.
+# Timeout defaults to 5 seconds (safety net — normal exit is via the $C002
+# exit port).
 
 set -e
 
+if [ $# -lt 1 ]; then
+    echo "usage: mamellvm6309-headless <rom-image> [timeout-seconds]" >&2
+    exit 1
+fi
+
+rom="$1"
+timeout="${2:-5}"
 here=$(dirname "$0")
-exec env SDL_VIDEO_DRIVER=dummy \
+
+# Temp files — cleaned up on exit.
+outfile=$(mktemp /tmp/llvm6309_out.XXXXXX)
+exitfile=$(mktemp /tmp/llvm6309_exit.XXXXXX)
+trap 'rm -f "$outfile" "$exitfile"' EXIT
+
+env SDL_VIDEO_DRIVER=dummy \
+    LLVM6309_EXIT_FILE="$exitfile" \
     "${here}/mamellvm6309" llvm6309 \
         -video none \
         -sound none \
         -window \
         -nothrottle \
-        "$@"
+        -keyboardprovider none \
+        -mouseprovider none \
+        -lightgunprovider none \
+        -joystickprovider none \
+        -midiprovider none \
+        -debugger none \
+        -skip_gameinfo \
+        -noplugins \
+        -uifontprovider none \
+        -rom "$rom" \
+        -rs232 null_modem \
+        -bitb "$outfile" \
+        -seconds_to_run "$timeout"
+
+cat "$outfile"
+
+# Return the exit-port value as our exit code (default 0 if not written).
+if [ -s "$exitfile" ]; then
+    exit_code=$(cat "$exitfile")
+    exit "$exit_code"
+fi
