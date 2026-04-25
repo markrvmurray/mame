@@ -3,39 +3,47 @@
 
 // Minimal HD6309 single-board computer for validating the llvm-mc6809 backend.
 //
-// Memory map
+// Memory map (top-to-bottom — $0000 at the top, $FFFF at the bottom):
 // ----------
-//   $0000-$BFFF   48K RAM
-//   $C000-$C001   MC6850 ACIA (serial console — 2-byte I/O window)
-//   $C002         Exit port (write any value → MAME exits cleanly)
-//   $C003-$FFFF   16K ROM (less the 3 bytes shadowed by the ACIA and exit port
-//                 at the start of the region; reset/IRQ vectors at $FFF0-$FFFF
-//                 are ROM as normal)
+//   $0000-$FFCF   RAM (~64K contiguous — no IO wedge in the middle)
+//   $FFD0-$FFD1   MC6850 ACIA (status, data)
+//   $FFD2         Exit port (write any value → MAME exits cleanly, value
+//                 captured as the process exit code)
+//   $FFD3         TraceCtl (program-controlled host-side logging toggle)
+//   $FFD4-$FFEF   RAM (reserved for future IO)
+//   $FFF0-$FFFF   Vector ROM (reads come from RAM populated at boot, writes
+//                 are dropped so a runaway program can't clobber the reset
+//                 entry)
 //
-// The ROM is loaded at runtime from a generic cartridge slot, so there is no
-// hash-verified ROM file baked into the driver — point `-cart` at a freshly
-// assembled/linked 16K image per test run. The image covers the full $C000-$FFFF
-// range; the bytes at offsets 0, 1, 2 (i.e. $C000-$C002) are ignored because
-// the ACIA and exit port are overlaid on top.
+// This layout mirrors the usim09batch simulator (see ../usim) so the same
+// test programs run unchanged on both emulators. The previous $C000 IO
+// overlay with a $C003-$FFFF cart ROM is gone — the machine is now a flat
+// RAM with a tiny IO slab and vector ROM stuck at the bottom, giving test
+// programs ~64 KB of contiguous address space.
 //
-// Typical LLVM execution-test invocation (headless-ish, lit-friendly):
+// The image is loaded at runtime from a generic cartridge slot; it is a
+// raw binary up to 64 KB (typically a full 64 KB image produced by
+// `lwasm --format=rawrel`). The bytes are memcpy'd into RAM at boot — the
+// bottom 16 bytes ($FFF0-$FFFF) end up as the reset/IRQ vectors.
 //
-//   mamellvm6309 llvm6309 -cart test.bin \
-//       -rs232 null_modem -bitb /tmp/out.txt \
-//       -window -nothrottle -seconds_to_run 2
+// Typical LLVM execution-test invocation (via the mamellvm6309-headless
+// wrapper):
 //
+//   mamellvm6309-headless test.bin 2
 //   FileCheck %s < /tmp/out.txt
 //
-// The test program ends with `sta $C002` (or any store to $C002) which calls
-// machine().schedule_exit() and terminates MAME — `-seconds_to_run` is then
-// only a safety net for runaway programs.
+// The test program ends with `sta $FFD2` which schedules a clean exit
+// ~2 ms later (enough time for the ACIA TX shift register to drain),
+// and the value stored becomes the process exit code.
 //
 // IRQ is intentionally not wired from the ACIA — polled TDRE/RDRF only.
 
 #include "emu.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "bus/generic/carts.h"
 #include "bus/generic/slot.h"
@@ -56,6 +64,7 @@ public:
 		, m_maincpu(*this, "maincpu")
 		, m_acia(*this, "acia")
 		, m_cart(*this, "cartslot")
+		, m_mem(*this, "mem")
 	{ }
 
 	void llvm6309(machine_config &config);
@@ -66,19 +75,38 @@ protected:
 private:
 	void mem_map(address_map &map) ATTR_COLD;
 	void exit_w(u8 data);
+	void tracectl_w(u8 data);
 	TIMER_CALLBACK_MEMBER(do_exit);
 	std::pair<std::error_condition, std::string> load_cart(device_image_interface &image);
 
 	required_device<hd6309_device> m_maincpu;
 	required_device<acia6850_device> m_acia;
 	required_device<generic_slot_device> m_cart;
+	required_shared_ptr<u8> m_mem;
 	emu_timer *m_exit_timer = nullptr;
 	u8 m_exit_code = 0;
+	bool m_trace_enabled = false;
 };
 
 void llvm6309_state::machine_start()
 {
 	m_exit_timer = timer_alloc(FUNC(llvm6309_state::do_exit), this);
+
+	// Populate RAM from the cart image. The cart is a raw binary (up to
+	// 64 KB); we memcpy the whole thing into the "mem" share so byte N of
+	// the cart ends up at address $N. The bottom 16 bytes ($FFF0-$FFFF)
+	// end up as the reset/IRQ vectors — reads go through normal RAM, but
+	// the .nopw() overlay in mem_map drops any subsequent writes so a
+	// runaway program can't clobber the reset entry.
+	u32 const size = m_cart->common_get_size("rom");
+	if (size > 0)
+	{
+		u8 const *src = m_cart->get_rom_base();
+		std::memcpy(&m_mem[0], src, std::min<u32>(size, 0x10000));
+	}
+
+	save_item(NAME(m_exit_code));
+	save_item(NAME(m_trace_enabled));
 }
 
 void llvm6309_state::exit_w(u8 data)
@@ -90,6 +118,41 @@ void llvm6309_state::exit_w(u8 data)
 	// output would be silently dropped.
 	m_exit_code = data;
 	m_exit_timer->adjust(attotime::from_msec(2));
+}
+
+void llvm6309_state::tracectl_w(u8 data)
+{
+	// Program-controlled host-side logging, matching usim's TraceCtl
+	// encoding so the same test programs toggle trace output on both
+	// emulators without an #ifdef:
+	//   0x00  disable
+	//   0x01  enable (brk-style markers via logerror)
+	//   0x02  enable + verbose (CPU PC on every tracectl write)
+	// Other values are no-ops. MAME's full per-instruction trace lives
+	// in the built-in debugger (-debug -debugscript …); this device is
+	// just a lightweight checkpoint that a test program can poke.
+	switch (data)
+	{
+	case 0x00:
+		m_trace_enabled = false;
+		break;
+	case 0x01:
+		m_trace_enabled = true;
+		logerror("TraceCtl: enabled at PC=%04X\n", m_maincpu->pc());
+		break;
+	case 0x02:
+		m_trace_enabled = true;
+		logerror("TraceCtl: verbose at PC=%04X A=%02X B=%02X X=%04X Y=%04X U=%04X S=%04X\n",
+				m_maincpu->pc(),
+				m_maincpu->state_int(M6809_A), m_maincpu->state_int(M6809_B),
+				m_maincpu->state_int(M6809_X), m_maincpu->state_int(M6809_Y),
+				m_maincpu->state_int(M6809_U), m_maincpu->state_int(M6809_S));
+		break;
+	default:
+		if (m_trace_enabled)
+			logerror("TraceCtl: %02X at PC=%04X\n", data, m_maincpu->pc());
+		break;
+	}
 }
 
 TIMER_CALLBACK_MEMBER(llvm6309_state::do_exit)
@@ -115,21 +178,29 @@ std::pair<std::error_condition, std::string> llvm6309_state::load_cart(device_im
 	u32 size = slot.common_get_size("rom");
 	if (size == 0)
 		return std::make_pair(image_error::INVALIDLENGTH, "Empty cartridge image");
-	if (size > 0x4000)
-		return std::make_pair(image_error::INVALIDLENGTH, "Cartridge image must be no larger than 16K");
-	slot.rom_alloc(0x4000, GENERIC_ROM8_WIDTH, ENDIANNESS_BIG);
+	if (size > 0x10000)
+		return std::make_pair(image_error::INVALIDLENGTH, "Cartridge image must be no larger than 64K");
+	slot.rom_alloc(0x10000, GENERIC_ROM8_WIDTH, ENDIANNESS_BIG);
 	slot.common_load_rom(slot.get_rom_base(), size, "rom");
 	return std::make_pair(std::error_condition(), std::string());
 }
 
 void llvm6309_state::mem_map(address_map &map)
 {
-	map(0x0000, 0xbfff).ram();
-	// Cart ROM covers $C000-$FFFF; ACIA and exit port below overlay the first
-	// three bytes. Later address_map entries override earlier ones.
-	map(0xc000, 0xffff).r(m_cart, FUNC(generic_slot_device::read_rom));
-	map(0xc000, 0xc001).rw(m_acia, FUNC(acia6850_device::read), FUNC(acia6850_device::write));
-	map(0xc002, 0xc002).w(FUNC(llvm6309_state::exit_w));
+	// Unified ~64 KB RAM. Test programs see a flat contiguous address
+	// space from $0000 down to $FFCF with no IO wedge in the middle.
+	map(0x0000, 0xffff).ram().share("mem");
+
+	// IO slab at the bottom, just above the vectors. These .rw()/.w()
+	// entries override the RAM mapping for their ranges (later wins).
+	map(0xffd0, 0xffd1).rw(m_acia, FUNC(acia6850_device::read), FUNC(acia6850_device::write));
+	map(0xffd2, 0xffd2).w(FUNC(llvm6309_state::exit_w));
+	map(0xffd3, 0xffd3).w(FUNC(llvm6309_state::tracectl_w));
+
+	// Vectors at $FFF0-$FFFF: reads still come from the underlying RAM
+	// (populated from the cart at machine_start), but writes are silently
+	// dropped so a runaway program can't clobber the reset entry.
+	map(0xfff0, 0xffff).nopw();
 }
 
 // null_modem defaults to 9600 baud. Our ACIA drives at 115200, so the
@@ -178,14 +249,14 @@ void llvm6309_state::llvm6309(machine_config &config)
 	rs232.rxd_handler().set(m_acia, FUNC(acia6850_device::write_rxd));
 	rs232.set_option_device_input_defaults("null_modem", DEVICE_INPUT_DEFAULTS_NAME(null_modem));
 
-	// 16K ROM via generic cart slot — pass with `-cart file.bin`.
+	// 64K raw-binary cart via generic cart slot — pass with `-rom file.bin`.
 	GENERIC_SOCKET(config, m_cart, generic_plain_slot, "llvm6309_rom", "bin,rom");
 	m_cart->set_device_load(FUNC(llvm6309_state::load_cart));
 	m_cart->set_must_be_loaded(true);
 }
 
 ROM_START(llvm6309)
-	// No baked ROM — the image comes from `-cart` at runtime.
+	// No baked ROM — the image comes from `-rom` at runtime.
 ROM_END
 
 } // anonymous namespace
