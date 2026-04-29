@@ -7,10 +7,10 @@
 # Usage:
 #   ./mamellvm6309-headless <rom-image> [timeout-seconds]
 #
-# Serial output goes to stdout. The value written to the exit port ($C002)
+# Serial output goes to stdout. The value written to the exit port ($FFD2)
 # becomes the process exit code (0-255).
 #
-# Timeout defaults to 5 seconds (safety net — normal exit is via the $C002
+# Timeout defaults to 5 seconds (safety net — normal exit is via the $FFD2
 # exit port).
 
 set -e
