@@ -669,6 +669,8 @@ static const std::map<std::string, const gdb_register_map &> gdb_register_maps =
 	{ "w65c02",     gdb_register_map_m6502 },
 	{ "w65c02s",    gdb_register_map_m6502 },
 	{ "m6809",      gdb_register_map_m6809 },
+	{ "hd6309",     gdb_register_map_m6809 },
+	{ "hd6309e",    gdb_register_map_m6809 },
 	{ "score7",     gdb_register_map_score7 },
 	{ "nios2",      gdb_register_map_nios2 },
 	{ "cxd8530q",   gdb_register_map_psxcpu },

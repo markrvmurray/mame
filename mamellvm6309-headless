@@ -6,17 +6,41 @@
 #
 # Usage:
 #   ./mamellvm6309-headless <rom-image> [timeout-seconds]
+#   ./mamellvm6309-headless --debug[=PORT] <rom-image>
 #
 # Serial output goes to stdout. The value written to the exit port ($FFD2)
 # becomes the process exit code (0-255).
 #
 # Timeout defaults to 5 seconds (safety net — normal exit is via the $FFD2
-# exit port).
+# exit port). Bug #164 (debugger attach):
+#   --debug          starts the gdbstub on port 2159 and runs without timeout.
+#   --debug=NNNN     starts the gdbstub on the specified port instead.
+# Once the gdbstub is listening, attach lldb (preferred) or gdb to it:
+#   $ lldb path/to/test.elf
+#   (lldb) gdb-remote localhost:2159
+# gdb interop also works:
+#   $ gdb path/to/test.elf -ex 'target remote :2159'
+# Stderr prints the listen address as soon as MAME comes up.
 
 set -e
 
+# Parse --debug / --debug=PORT.
+debug_mode=0
+debug_port=2159
+case "${1-}" in
+    --debug)
+        debug_mode=1
+        shift
+        ;;
+    --debug=*)
+        debug_mode=1
+        debug_port=${1#--debug=}
+        shift
+        ;;
+esac
+
 if [ $# -lt 1 ]; then
-    echo "usage: mamellvm6309-headless <rom-image> [timeout-seconds]" >&2
+    echo "usage: mamellvm6309-headless [--debug[=PORT]] <rom-image> [timeout-seconds]" >&2
     exit 1
 fi
 
@@ -29,28 +53,62 @@ outfile=$(mktemp /tmp/llvm6309_out.XXXXXX)
 exitfile=$(mktemp /tmp/llvm6309_exit.XXXXXX)
 trap 'rm -f "$outfile" "$exitfile"' EXIT
 
-env SDL_VIDEO_DRIVER=dummy \
-    LLVM6309_EXIT_FILE="$exitfile" \
-    "${here}/mamellvm6309" llvm6309 \
-        -video none \
-        -sound none \
-        -window \
-        -nothrottle \
-        -keyboardprovider none \
-        -mouseprovider none \
-        -lightgunprovider none \
-        -joystickprovider none \
-        -midiprovider none \
-        -debugger none \
-        -skip_gameinfo \
-        -noplugins \
-        -uifontprovider none \
-        -rom "$rom" \
-        -rs232 null_modem \
-        -bitb "$outfile" \
-        -seconds_to_run "$timeout"
+if [ "$debug_mode" -eq 1 ]; then
+    # gdbstub mode: drop -debugger none for -debugger gdbstub, drop the
+    # runaway-safety -seconds_to_run (interactive sessions shouldn't time
+    # out at 5 s), and skip catting the bitbanger after — the user is
+    # driving with lldb / gdb.
+    #
+    # Note: debug execution PAUSES UNTIL a client connects, so the
+    # process appears to hang on startup until you attach.
+    echo "mamellvm6309 listening for gdb-RSP on localhost:${debug_port}" >&2
+    echo "  attach with: lldb \"$rom\" -o 'gdb-remote localhost:${debug_port}'" >&2
+    env SDL_VIDEO_DRIVER=dummy \
+        LLVM6309_EXIT_FILE="$exitfile" \
+        "${here}/mamellvm6309" llvm6309 \
+            -video none \
+            -sound none \
+            -window \
+            -nothrottle \
+            -keyboardprovider none \
+            -mouseprovider none \
+            -lightgunprovider none \
+            -joystickprovider none \
+            -midiprovider none \
+            -debugger gdbstub \
+            -debugger_host localhost \
+            -debugger_port "$debug_port" \
+            -debug \
+            -skip_gameinfo \
+            -noplugins \
+            -uifontprovider none \
+            -rom "$rom" \
+            -rs232 null_modem \
+            -bitb "$outfile"
+else
+    env SDL_VIDEO_DRIVER=dummy \
+        LLVM6309_EXIT_FILE="$exitfile" \
+        "${here}/mamellvm6309" llvm6309 \
+            -video none \
+            -sound none \
+            -window \
+            -nothrottle \
+            -keyboardprovider none \
+            -mouseprovider none \
+            -lightgunprovider none \
+            -joystickprovider none \
+            -midiprovider none \
+            -debugger none \
+            -skip_gameinfo \
+            -noplugins \
+            -uifontprovider none \
+            -rom "$rom" \
+            -rs232 null_modem \
+            -bitb "$outfile" \
+            -seconds_to_run "$timeout"
 
-cat "$outfile"
+    cat "$outfile"
+fi
 
 # Return the exit-port value as our exit code (default 0 if not written).
 if [ -s "$exitfile" ]; then
