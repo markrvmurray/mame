@@ -51,7 +51,13 @@ here=$(dirname "$0")
 # Temp files — cleaned up on exit.
 outfile=$(mktemp /tmp/llvm6309_out.XXXXXX)
 exitfile=$(mktemp /tmp/llvm6309_exit.XXXXXX)
-trap 'rm -f "$outfile" "$exitfile"' EXIT
+# Bug #194 Phase C: cycle counting. The driver writes the HD6309's
+# total_cycles() into LLVM6309_CYCLES_FILE on exit; we read it after
+# MAME tears down and emit `cycles=<N>` to stderr — same format
+# `usim09batch --cycles` uses, so the picolibc bench harness's
+# CYCLES_RE regex picks it up without change.
+cyclesfile=$(mktemp /tmp/llvm6309_cycles.XXXXXX)
+trap 'rm -f "$outfile" "$exitfile" "$cyclesfile"' EXIT
 
 if [ "$debug_mode" -eq 1 ]; then
     # gdbstub mode: drop -debugger none for -debugger gdbstub, drop the
@@ -65,6 +71,7 @@ if [ "$debug_mode" -eq 1 ]; then
     echo "  attach with: lldb \"$rom\" -o 'gdb-remote localhost:${debug_port}'" >&2
     env SDL_VIDEO_DRIVER=dummy \
         LLVM6309_EXIT_FILE="$exitfile" \
+        LLVM6309_CYCLES_FILE="$cyclesfile" \
         "${here}/mamellvm6309" llvm6309 \
             -video none \
             -sound none \
@@ -88,6 +95,7 @@ if [ "$debug_mode" -eq 1 ]; then
 else
     env SDL_VIDEO_DRIVER=dummy \
         LLVM6309_EXIT_FILE="$exitfile" \
+        LLVM6309_CYCLES_FILE="$cyclesfile" \
         "${here}/mamellvm6309" llvm6309 \
             -video none \
             -sound none \
@@ -108,10 +116,29 @@ else
             -seconds_to_run "$timeout"
 
     cat "$outfile"
+
+    # Bug #194 Phase C: emit `cycles=<N>` to stderr if the driver wrote
+    # one. Format mirrors `usim09batch --cycles`; bench harnesses parse
+    # both with the same regex.
+    if [ -s "$cyclesfile" ]; then
+        echo "cycles=$(cat "$cyclesfile")" >&2
+    fi
 fi
 
-# Return the exit-port value as our exit code (default 0 if not written).
+# Return the exit-port value as our exit code, OR 124 (GNU `timeout(1)`
+# convention) when the test hit MAME's -seconds_to_run cap without
+# writing the exit port. Matches usim09batch's rc=124-on-cap behavior;
+# the picolibc bench harness (run-mc6809-tests) already reclassifies
+# rc=124 as TIMEOUT rather than FAIL.
+#
+# Without this, slow tests that exceed the cap exit silently 0 and get
+# recorded as false-positive OKs (with NULL cycles, since do_exit
+# never fired to write the cycles file). Bug #194 Phase C surfaced
+# this: visible after cycle-counting plumbing landed because the
+# missing `cycles=` lines flagged the timeout cases that had been
+# masquerading as passes.
 if [ -s "$exitfile" ]; then
     exit_code=$(cat "$exitfile")
     exit "$exit_code"
 fi
+exit 124

@@ -169,6 +169,27 @@ TIMER_CALLBACK_MEMBER(llvm6309_state::do_exit)
 			fclose(f);
 		}
 	}
+
+	// Bug #194 Phase C: cycle counting parity with usim09batch.
+	// usim emits `cycles=<N>` to stderr when --cycles is passed; the
+	// picolibc bench harness (run-mc6809-tests) parses that line and
+	// records it in the SQLite ledger. Mirror the same surface from
+	// MAME by writing the HD6309's total_cycles() to a sidecar file
+	// when LLVM6309_CYCLES_FILE is set; the headless wrapper reads
+	// it post-exit and emits `cycles=<N>` to stderr — the existing
+	// CYCLES_RE regex in run-mc6809-tests picks it up unchanged.
+	const char *cyc_path = getenv("LLVM6309_CYCLES_FILE");
+	if (cyc_path)
+	{
+		FILE *cf = fopen(cyc_path, "w");
+		if (cf)
+		{
+			fprintf(cf, "%llu\n",
+				(unsigned long long)m_maincpu->total_cycles());
+			fclose(cf);
+		}
+	}
+
 	machine().schedule_exit();
 }
 
