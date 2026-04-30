@@ -22,17 +22,25 @@ process appears to hang on startup until you attach.
 
 ## Building a cart image from a picolibc test ELF
 
-The standard recipe (matches `mamellvm6309`'s 64 KB raw cart slot):
+The standard recipe (matches `mamellvm6309`'s 64 KB raw cart slot).
+The raw binary offset must match the ELF's lowest LOAD VMA -- $0100 for
+code-only tests, but lower (e.g. $0021) for tests with __directpage data.
+The reset vector is NOT in any ELF LOAD segment and must be written explicitly.
 
     LLVM=/Users/markmurray/GitHub/llvm-mc6809/llvm/cmake-build-debug-system/bin
     ELF=/path/to/test.elf
-    $LLVM/llvm-objcopy -O binary --gap-fill=0 --pad-to=0x10000 "$ELF" /tmp/raw.bin
+
+    # Find lowest LOAD VMA -- byte offset into the 64K cart image
+    LOW_VMA=$($LLVM/llvm-readelf -l "$ELF" | awk '/LOAD/{print $3}' | sort | head -1)
+    OFFSET=$(printf '%d' "$LOW_VMA")
+
+    $LLVM/llvm-objcopy -O binary --gap-fill=0x00 --pad-to=0x10000 "$ELF" /tmp/raw.bin
     dd if=/dev/zero of=/tmp/cart.bin bs=65536 count=1
-    # Lift by lowest-LOAD-addr (typically $0100 for picolibc):
-    dd if=/tmp/raw.bin of=/tmp/cart.bin bs=256 seek=1 conv=notrunc
-    # Reset vector — _start address big-endian at $FFFE
-    # (look up _start with `llvm-nm "$ELF" | grep _start`):
-    printf '\xFF\xC0' | dd of=/tmp/cart.bin bs=1 seek=65534 conv=notrunc
+    dd if=/tmp/raw.bin of=/tmp/cart.bin bs=1 seek=$OFFSET conv=notrunc
+
+    # Write reset vector ($FFFE-$FFFF) -- _start address big-endian
+    START=$($LLVM/llvm-nm "$ELF" | awk '/ _start$/{print $1}')
+    printf "\x${START:4:2}\x${START:6:2}" | dd of=/tmp/cart.bin bs=1 seek=65534 conv=notrunc
 
 ## Attaching with lldb (preferred)
 
@@ -58,50 +66,23 @@ The standard recipe (matches `mamellvm6309`'s 64 KB raw cart slot):
     (gdb) kill
     (gdb) quit
 
-## Known gap — host-side debugger needs MC6809 architecture support
+## Host-side debugger support — RESOLVED (bug #164 Tier 1, 2026-04-29)
 
-MAME's gdbstub serves a `target.xml` that declares
-`<architecture>m6809</architecture>`. For lldb / gdb to decode the
-register-read response (`g` packet) and disassemble the memory
-contents (`m` packet output), the **client** must have MC6809
-architecture support compiled in.
+The in-tree lldb (built from the llvm-mc6809 fork) now includes full MC6809
+architecture support:
 
-**As of 2026-04-29**:
+- `ABIMC6809` plugin: register table (D, X, Y, U, S, PC, A, B, CC, DP),
+  function-entry and default unwind plans
+- `eCore_mc6809` in ArchSpec + core definition
+- `ObjectFileELF` overrides for ELF32-container / 2-byte-pointer mismatch
 
-- macOS system `/usr/bin/lldb` (`lldb-2100.0.16.12`) connects and
-  receives stop events (`SIGTRAP` after `b main`+`c`), but cannot
-  load MC6809 ELF executables (`error: ... is not a valid
-  executable`) and cannot decode registers/memory because no
-  MC6809 plugin is bundled.
-- Homebrew `gdb` (via `brew install gdb`) ships gdb-15.x with
-  multi-architecture support and CAN consume the served target.xml
-  on architectures it knows. **Status of m6809 support in upstream
-  gdb is currently uncertain** — needs verification before relying
-  on this path.
+Use the in-tree lldb, not the system lldb:
 
-Workarounds while waiting for first-class lldb/gdb support:
+    LLDB=/Users/markmurray/GitHub/llvm-mc6809/llvm/cmake-build-debug-system/bin/lldb
+    $LLDB path/to/test.elf
+    (lldb) gdb-remote localhost:2159
 
-- **Wire-level confirmation**: raw RSP packets via `nc`. MAME's
-  gdbstub responds to `qSupported`, `?`, `qC`, etc. before any
-  client knows the architecture. `g` (read registers) requires
-  `qXfer:features:read:target.xml` to have been requested first —
-  a real client does this automatically; raw nc must do it
-  explicitly.
-
-- **MAME's built-in debug UI**: drop `-debugger gdbstub` and use
-  `-debug` alone. Brings up MAME's native debugger window with full
-  HD6309 state inspection, breakpoints, watchpoints, source-file
-  disassembly. Heavier but architecture-aware. This is the
-  practical fallback today.
-
-- **`tracectl` from inside the program**: poke `0x01` (or `0x02`
-  for verbose) to `$FFD3` to enable per-instruction host-side
-  trace logging. Lightweight, works through the headless wrapper.
-
-A future-bug pass can address the host-side gap by either (a)
-contributing a m6809 ABI plugin to upstream LLDB, or (b) wiring up
-a custom gdb (e.g. via the `m6809-elf` target patches that exist
-out of tree).
+The system `/usr/bin/lldb` still cannot load MC6809 ELF files.
 
 ## What changed under the hood
 
