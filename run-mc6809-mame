@@ -102,20 +102,31 @@ else
     : > "$raw"   # keep trap happy
 fi
 
-# Reset vector: ensure $FFFE-$FFFF holds the entry point. picolibc's
-# linker script PROVIDEs vectors via its own .vectors section, so most
-# ELFs already have the right bytes at offset $FFFE in the cart. For
-# stripped/minimal ELFs (some lit tests), patch defensively if the
-# slot is still 0x0000.
+# Reset vector: ensure $FFFE-$FFFF holds the address of `_start`.
+#
+# Two patterns we have to support:
+#   * llvm-mc6809 lit Execution tests use a custom link.ld that emits
+#     a `.vectors` LOAD section at $FFF0; the cart already has the
+#     right bytes at $FFFE.
+#   * picolibc tests use a different linker script that PROVIDEs the
+#     .init entry stub at $FFC0 but does NOT emit .vectors at all,
+#     leaving $FFFE untouched. The ELF entry point is also 0
+#     (because picolibc's link.ld doesn't set ENTRY()), so we can't
+#     use it here either.
+#
+# Fall back to llvm-nm lookup of the `_start` symbol when the bytes
+# at $FFFE-$FFFF are still zero. Mirrors the same logic in
+# `run-mc6809` (the usim equivalent), which has handled this for
+# picolibc since day one.
 vec_hi=$(dd if="$cart" bs=1 skip=65534 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
 vec_lo=$(dd if="$cart" bs=1 skip=65535 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
 if [ "$vec_hi" = "0" ] && [ "$vec_lo" = "0" ]; then
-    entry=$("$READELF" -h "$elf" | awk '/Entry point/{print $NF}')
-    if [ -n "$entry" ]; then
-        # entry is hex (with 0x prefix); split into hi/lo bytes
-        hi=$(( ($entry >> 8) & 0xFF ))
-        lo=$(( $entry & 0xFF ))
-        printf '\\%03o\\%03o' "$hi" "$lo" | xargs -0 printf '%b' | \
+    NM="${LLVM_NM:-llvm-nm}"
+    start_addr=$("$NM" "$elf" 2>/dev/null | awk '$3=="_start"{print $1; exit}')
+    if [ -n "$start_addr" ]; then
+        hi_dec=$(( 0x$start_addr >> 8 & 0xFF ))
+        lo_dec=$(( 0x$start_addr & 0xFF ))
+        printf '\\%03o\\%03o' "$hi_dec" "$lo_dec" | xargs -0 printf '%b' | \
             dd of="$cart" bs=1 seek=65534 count=2 conv=notrunc status=none
     fi
 fi
