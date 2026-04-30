@@ -1,0 +1,123 @@
+#!/bin/sh
+#
+# run-mc6809-mame — lit-friendly wrapper around mamellvm6309-headless
+#
+# Usage: run-mc6809-mame <elf> [timeout-seconds]
+#
+# Drop-in equivalent of `usim09batch <hex>` for HD6309 lit tests:
+#   * accepts an ELF (the natural output of ld.lld),
+#   * converts to a 64-KB raw cart `.bin` (objcopy --pad-to=0x10000),
+#   * patches the reset vector at $FFFE to the ELF entry point if the
+#     cart bytes there are zero (belt-and-braces — runtime.inc / crt0
+#     usually places it already),
+#   * invokes `mamellvm6309-headless`, returning its stdout/exit
+#     unchanged.
+#
+# The lowest LOAD VMA (computed via `llvm-readelf -l`) determines where
+# byte 0 of the ELF data lands inside the cart. Naïve `dd seek=0x100`
+# would mis-place programs whose lowest segment is below $0100 (e.g.
+# `.dp_data` at $0021 in picolibc tests with directpage enabled, see
+# bug #200 retrospective).
+#
+# Environment:
+#   MAMELLVM6309_HEADLESS  override path to mamellvm6309-headless
+#                          (default: sibling of this script)
+#   LLVM_OBJCOPY           override (default: llvm-objcopy on PATH)
+#   LLVM_READELF           override (default: llvm-readelf on PATH)
+#
+
+set -e
+
+if [ $# -lt 1 ]; then
+    echo "usage: run-mc6809-mame <elf> [timeout-seconds]" >&2
+    exit 1
+fi
+
+elf="$1"
+timeout="${2:-5}"
+
+here=$(cd "$(dirname "$0")" && pwd)
+HEADLESS="${MAMELLVM6309_HEADLESS:-$here/mamellvm6309-headless}"
+OBJCOPY="${LLVM_OBJCOPY:-llvm-objcopy}"
+READELF="${LLVM_READELF:-llvm-readelf}"
+
+if [ ! -x "$HEADLESS" ]; then
+    echo "run-mc6809-mame: cannot find mamellvm6309-headless at $HEADLESS" >&2
+    exit 1
+fi
+
+cart=$(mktemp /tmp/llvm6309-cart.XXXXXX)
+raw=$(mktemp /tmp/llvm6309-raw.XXXXXX)
+trap 'rm -f "$cart" "$raw"' EXIT
+
+# objcopy -O binary emits bytes starting at the LOWEST LOAD VMA, with
+# inter-segment gaps zero-filled. For an ELF whose lowest LOAD is e.g.
+# $4000 (typical MC6809 lit Execution layout: .rom at $4000, vectors at
+# $FFF0, no LOAD segment below), the raw output is only $C000 bytes
+# and starts at memory offset $4000.
+#
+# MAME's `llvm6309` driver memcpy's the cart into address $0000 of the
+# emulated address space, so we need a 64-KB image where byte N
+# corresponds to memory address N. The fix is to prepend the raw output
+# with a zero block sized to the lowest LOAD VMA, then pad the tail to
+# exactly 64 KB.
+# Pick the lowest LOAD program header whose FileSiz > 0. NOLOAD segments
+# (e.g. .directpage at $0000 with FileSiz=0) get a program header but
+# contribute no bytes to objcopy's binary output, so they must be
+# skipped when computing the cart offset.
+LOW_VMA=$("$READELF" -l "$elf" | awk '
+    function hex2dec(s,    n, i, c, v) {
+        sub(/^0x/, "", s)
+        n = 0
+        for (i = 1; i <= length(s); i++) {
+            c = tolower(substr(s, i, 1))
+            v = index("0123456789abcdef", c) - 1
+            n = n * 16 + v
+        }
+        return n
+    }
+    /^[ \t]*LOAD/ {
+        # Columns: Type Offset VirtAddr PhysAddr FileSiz MemSiz Flg Align
+        filesiz = hex2dec($5)
+        vaddr   = hex2dec($3)
+        if (filesiz > 0 && (low == "" || vaddr < low_dec)) {
+            low = $3
+            low_dec = vaddr
+        }
+    }
+    END { print low }
+')
+LOW_VMA_DEC=$(( ${LOW_VMA:-0x0} ))
+"$OBJCOPY" -O binary --pad-to=0x10000 "$elf" "$raw"
+# Compose the final 64-KB cart: $LOW_VMA_DEC zero bytes, then the raw
+# output, truncated to exactly 64 KB.
+if [ "$LOW_VMA_DEC" -gt 0 ]; then
+    dd if=/dev/zero of="$cart" bs=1 count="$LOW_VMA_DEC" status=none
+    cat "$raw" >> "$cart"
+    # Truncate to exactly 64 KB.
+    dd if="$cart" of="$cart.t" bs=1 count=65536 status=none 2>/dev/null
+    mv "$cart.t" "$cart"
+else
+    mv "$raw" "$cart"
+    : > "$raw"   # keep trap happy
+fi
+
+# Reset vector: ensure $FFFE-$FFFF holds the entry point. picolibc's
+# linker script PROVIDEs vectors via its own .vectors section, so most
+# ELFs already have the right bytes at offset $FFFE in the cart. For
+# stripped/minimal ELFs (some lit tests), patch defensively if the
+# slot is still 0x0000.
+vec_hi=$(dd if="$cart" bs=1 skip=65534 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+vec_lo=$(dd if="$cart" bs=1 skip=65535 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+if [ "$vec_hi" = "0" ] && [ "$vec_lo" = "0" ]; then
+    entry=$("$READELF" -h "$elf" | awk '/Entry point/{print $NF}')
+    if [ -n "$entry" ]; then
+        # entry is hex (with 0x prefix); split into hi/lo bytes
+        hi=$(( ($entry >> 8) & 0xFF ))
+        lo=$(( $entry & 0xFF ))
+        printf '\\%03o\\%03o' "$hi" "$lo" | xargs -0 printf '%b' | \
+            dd of="$cart" bs=1 seek=65534 count=2 conv=notrunc status=none
+    fi
+fi
+
+exec "$HEADLESS" "$cart" "$timeout"

@@ -43,6 +43,8 @@
 !/LICENSE
 # MRVM: headless-run wrapper for the llvm6309 subtarget (see README_MRVM.md)
 !/mamellvm6309-headless
+# MRVM: cart-image wrapper used by lit / picolibc (see README_MRVM.md, bug #194)
+!/run-mc6809-mame
 /.idea
 .vscode
 docs/build
