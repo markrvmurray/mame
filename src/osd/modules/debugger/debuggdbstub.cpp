@@ -1331,6 +1331,13 @@ debug_gdbstub::cmd_reply debug_gdbstub::handle_q(const char *buf)
 	{
 		std::string reply = string_format("PacketSize=%x", MAX_PACKET_SIZE);
 		reply += ";qXfer:features:read+";
+		// Bug #222: advertise breakpoint-kind reporting so clients (lldb,
+		// modern gdb) send Z0/Z1 packets straight to cmd_Z instead of
+		// trying to patch target memory with a soft-trap insn — the latter
+		// silently fails on architectures (like HD6309) where the client
+		// has no canonical trap byte. Paired with send_stop_packet()'s
+		// "swbreak:;" / "hwbreak:;" tag emission below.
+		reply += ";swbreak+;hwbreak+";
 		send_reply(reply);
 		return REPLY_NONE;
 	}
@@ -1518,6 +1525,14 @@ void debug_gdbstub::send_stop_packet()
 {
 	int signal = 5; // GDB_SIGNAL_TRAP
 	std::string reply = string_format("T%02x", signal);
+	// Bug #222: when a Z0/Z1 breakpoint fires, tag the stop reply with
+	// "swbreak:;". Clients (lldb, modern gdb) advertise swbreak+/hwbreak+
+	// in qSupported and use the tag to disambiguate breakpoint stops
+	// from single-step/signal stops. Z0 and Z1 are indistinguishable
+	// internally (both go through debug->breakpoint_set()), so we emit
+	// the simpler swbreak form — clients treat it the same as hwbreak.
+	if ( m_triggered_breakpoint != nullptr )
+		reply += "swbreak:;";
 	if ( m_triggered_watchpoint != nullptr )
 	{
 		switch ( m_triggered_watchpoint->type() )
