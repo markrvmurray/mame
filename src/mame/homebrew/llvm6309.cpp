@@ -21,10 +21,24 @@
 // RAM with a tiny IO slab and vector ROM stuck at the bottom, giving test
 // programs ~64 KB of contiguous address space.
 //
-// The image is loaded at runtime from a generic cartridge slot; it is a
-// raw binary up to 64 KB (typically a full 64 KB image produced by
-// `lwasm --format=rawrel`). The bytes are memcpy'd into RAM at boot — the
-// bottom 16 bytes ($FFF0-$FFFF) end up as the reset/IRQ vectors.
+// The image is loaded at runtime from a generic cartridge slot. Two
+// formats are accepted:
+//
+//   * Raw binary up to 64 KB (typically a full 64 KB image produced by
+//     `lwasm --format=rawrel` or `llvm-objcopy -O binary --pad-to=0x10000`).
+//     The bytes are memcpy'd into RAM at boot — the bottom 16 bytes
+//     ($FFF0-$FFFF) end up as the reset/IRQ vectors.
+//
+//   * ELF32 (the natural output of llvm-mc6809's lld and lwlink — the
+//     llvm-mc6809 toolchain emits big-endian, lwlink either; both
+//     are accepted). Each PT_LOAD program header with FileSiz > 0 is
+//     copied into the 64 KB cart at its VMA. If the reset vector at
+//     $FFFE-$FFFF is still zero after all segments are placed, it is
+//     patched with the `_start` symbol's value (looked up in
+//     `.symtab`). This mirrors what the `run-mc6809-mame` shell
+//     wrapper used to do externally via objcopy + nm + dd, so
+//     debug-mode (`--debug=PORT`) and non-debug invocations both
+//     accept ELFs with no preprocessing.
 //
 // Typical LLVM execution-test invocation (via the mamellvm6309-headless
 // wrapper):
@@ -92,18 +106,17 @@ void llvm6309_state::machine_start()
 {
 	m_exit_timer = timer_alloc(FUNC(llvm6309_state::do_exit), this);
 
-	// Populate RAM from the cart image. The cart is a raw binary (up to
-	// 64 KB); we memcpy the whole thing into the "mem" share so byte N of
-	// the cart ends up at address $N. The bottom 16 bytes ($FFF0-$FFFF)
-	// end up as the reset/IRQ vectors — reads go through normal RAM, but
-	// the .nopw() overlay in mem_map drops any subsequent writes so a
-	// runaway program can't clobber the reset entry.
-	u32 const size = m_cart->common_get_size("rom");
-	if (size > 0)
-	{
-		u8 const *src = m_cart->get_rom_base();
-		std::memcpy(&m_mem[0], src, std::min<u32>(size, 0x10000));
-	}
+	// Populate RAM from the cart image. The cart slot always allocates
+	// exactly 64 KB (load_cart() pads .bin and lays out ELF PT_LOAD
+	// segments into a fixed-size buffer). Copy the whole 64 KB into
+	// the "mem" share so byte N of the cart ends up at address $N.
+	// The bottom 16 bytes ($FFF0-$FFFF) end up as the reset/IRQ
+	// vectors — reads go through normal RAM, but the .nopw() overlay
+	// in mem_map drops any subsequent writes so a runaway program
+	// can't clobber the reset entry.
+	u8 const *src = m_cart->get_rom_base();
+	if (src != nullptr)
+		std::memcpy(&m_mem[0], src, 0x10000);
 
 	save_item(NAME(m_exit_code));
 	save_item(NAME(m_trace_enabled));
@@ -193,16 +206,169 @@ TIMER_CALLBACK_MEMBER(llvm6309_state::do_exit)
 	machine().schedule_exit();
 }
 
+// Helpers for the inline ELF32 parser. The data byte-order is taken
+// from e_ident[EI_DATA]: 1 = ELFDATA2LSB, 2 = ELFDATA2MSB. The
+// llvm-mc6809 toolchain emits BE (matching the M6809's natural byte
+// order for multi-byte values); USim's lwasm/lwlink emits BE too.
+// We support both for portability.
+static inline u16 read_le16(const u8 *p) { return u16(p[0]) | (u16(p[1]) << 8); }
+static inline u32 read_le32(const u8 *p)
+{
+	return u32(p[0]) | (u32(p[1]) << 8) | (u32(p[2]) << 16) | (u32(p[3]) << 24);
+}
+static inline u16 read_be16(const u8 *p) { return (u16(p[0]) << 8) | u16(p[1]); }
+static inline u32 read_be32(const u8 *p)
+{
+	return (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | u32(p[3]);
+}
+
+// Lay out an ELF32 image into the 64 KB cart buffer. Walks PT_LOAD
+// program headers, memcpy's each segment to its VMA, then patches the
+// reset vector at $FFFE-$FFFF from `_start` if it's still zero. The
+// cart is assumed pre-zeroed by the caller.
+static std::pair<std::error_condition, std::string>
+load_elf_into_cart(const u8 *elf, u32 elf_size, u8 *cart)
+{
+	if (elf_size < 52)
+		return std::make_pair(image_error::INVALIDIMAGE, "ELF: header truncated");
+
+	// e_ident sanity: ELFCLASS32 (1), data byte-order (1 LSB / 2 MSB)
+	if (elf[4] != 1)
+		return std::make_pair(image_error::INVALIDIMAGE, "ELF: not ELFCLASS32");
+	bool const be = (elf[5] == 2);
+	if (!be && elf[5] != 1)
+		return std::make_pair(image_error::INVALIDIMAGE, "ELF: invalid EI_DATA");
+	auto rd16 = [be](const u8 *p) { return be ? read_be16(p) : read_le16(p); };
+	auto rd32 = [be](const u8 *p) { return be ? read_be32(p) : read_le32(p); };
+
+	u32 const e_phoff     = rd32(elf + 28);
+	u16 const e_phentsize = rd16(elf + 42);
+	u16 const e_phnum     = rd16(elf + 44);
+	u32 const e_shoff     = rd32(elf + 32);
+	u16 const e_shentsize = rd16(elf + 46);
+	u16 const e_shnum     = rd16(elf + 48);
+
+	if (e_phentsize < 32 || e_shentsize < 40)
+		return std::make_pair(image_error::INVALIDIMAGE, "ELF: unexpected header sizes");
+
+	// Walk PT_LOAD program headers and place them in the cart.
+	for (u16 i = 0; i < e_phnum; i++)
+	{
+		u32 const phoff = e_phoff + u32(i) * e_phentsize;
+		if (phoff + 32 > elf_size)
+			return std::make_pair(image_error::INVALIDIMAGE, "ELF: truncated program header");
+		const u8 *ph = elf + phoff;
+
+		u32 const p_type   = rd32(ph + 0);
+		u32 const p_offset = rd32(ph + 4);
+		u32 const p_vaddr  = rd32(ph + 8);
+		u32 const p_filesz = rd32(ph + 16);
+
+		if (p_type != 1 /* PT_LOAD */ || p_filesz == 0)
+			continue;
+
+		if (p_vaddr >= 0x10000 || p_filesz > 0x10000 || p_vaddr + p_filesz > 0x10000)
+			return std::make_pair(image_error::INVALIDLENGTH,
+				"ELF: PT_LOAD segment escapes 64 KB cart");
+		if (p_offset > elf_size || p_offset + p_filesz > elf_size)
+			return std::make_pair(image_error::INVALIDIMAGE, "ELF: PT_LOAD past EOF");
+
+		std::memcpy(cart + p_vaddr, elf + p_offset, p_filesz);
+	}
+
+	// Reset vector at $FFFE-$FFFF: if still zero (no .vectors LOAD in
+	// this ELF — typical for picolibc), patch from `_start`. Mirrors
+	// the llvm-nm fallback in the legacy run-mc6809-mame wrapper.
+	if (cart[0xfffe] == 0 && cart[0xffff] == 0 && e_shoff != 0 && e_shnum != 0)
+	{
+		// Find SHT_SYMTAB (sh_type == 2). At most one in a normal ELF.
+		u32 symtab_off = 0, symtab_size = 0, symtab_link = 0, symtab_entsize = 0;
+		for (u16 i = 0; i < e_shnum; i++)
+		{
+			u32 const shoff = e_shoff + u32(i) * e_shentsize;
+			if (shoff + 40 > elf_size)
+				break;
+			const u8 *sh = elf + shoff;
+			u32 const sh_type = rd32(sh + 4);
+			if (sh_type == 2 /* SHT_SYMTAB */)
+			{
+				symtab_off     = rd32(sh + 16);
+				symtab_size    = rd32(sh + 20);
+				symtab_link    = rd32(sh + 24);
+				symtab_entsize = rd32(sh + 36);
+				break;
+			}
+		}
+
+		if (symtab_off != 0 && symtab_entsize >= 16
+				&& symtab_off + symtab_size <= elf_size
+				&& symtab_link != 0 && symtab_link < e_shnum)
+		{
+			// Resolve the linked .strtab so we can match symbol names.
+			u32 const strtab_shoff = e_shoff + u32(symtab_link) * e_shentsize;
+			u32 strtab_off = 0, strtab_size = 0;
+			if (strtab_shoff + 40 <= elf_size)
+			{
+				const u8 *sh = elf + strtab_shoff;
+				strtab_off  = rd32(sh + 16);
+				strtab_size = rd32(sh + 20);
+			}
+
+			if (strtab_off != 0 && strtab_off + strtab_size <= elf_size)
+			{
+				const char *strtab = reinterpret_cast<const char *>(elf + strtab_off);
+				for (u32 off = 0; off + 16 <= symtab_size; off += symtab_entsize)
+				{
+					const u8 *sym = elf + symtab_off + off;
+					u32 const st_name  = rd32(sym + 0);
+					u32 const st_value = rd32(sym + 4);
+					if (st_name == 0 || st_name >= strtab_size)
+						continue;
+					if (std::strcmp(strtab + st_name, "_start") != 0)
+						continue;
+					if (st_value < 0x10000)
+					{
+						cart[0xfffe] = u8((st_value >> 8) & 0xff);
+						cart[0xffff] = u8(st_value & 0xff);
+					}
+					break;
+				}
+			}
+		}
+	}
+
+	return std::make_pair(std::error_condition(), std::string());
+}
+
 std::pair<std::error_condition, std::string> llvm6309_state::load_cart(device_image_interface &image)
 {
 	generic_slot_device &slot = downcast<generic_slot_device &>(image.device());
-	u32 size = slot.common_get_size("rom");
+	u32 const size = slot.common_get_size("rom");
 	if (size == 0)
 		return std::make_pair(image_error::INVALIDLENGTH, "Empty cartridge image");
+
+	// Read the entire image into a temp buffer first so we can sniff
+	// for ELF magic. Raw .bin/.rom carts are <= 64 KB; ELFs may be
+	// many MB once `.debug_*` sections are included, so we DON'T
+	// reject on size up-front (only on the post-parse layout check).
+	std::vector<u8> raw(size);
+	slot.common_load_rom(&raw[0], size, "rom");
+
+	// Allocate the 64 KB cart and zero-fill. ELF segments leave gaps
+	// (e.g. between .text at $0100 and .vectors at $FFF0); the gaps
+	// must be zero so the IO slab at $FFD0+ works correctly.
+	slot.rom_alloc(0x10000, GENERIC_ROM8_WIDTH, ENDIANNESS_BIG);
+	u8 *const cart = slot.get_rom_base();
+	std::memset(cart, 0, 0x10000);
+
+	// ELF magic: 0x7F 'E' 'L' 'F'.
+	if (size >= 4 && raw[0] == 0x7f && raw[1] == 'E' && raw[2] == 'L' && raw[3] == 'F')
+		return load_elf_into_cart(&raw[0], size, cart);
+
+	// Raw binary (legacy .bin/.rom path).
 	if (size > 0x10000)
 		return std::make_pair(image_error::INVALIDLENGTH, "Cartridge image must be no larger than 64K");
-	slot.rom_alloc(0x10000, GENERIC_ROM8_WIDTH, ENDIANNESS_BIG);
-	slot.common_load_rom(slot.get_rom_base(), size, "rom");
+	std::memcpy(cart, &raw[0], size);
 	return std::make_pair(std::error_condition(), std::string());
 }
 
@@ -271,7 +437,10 @@ void llvm6309_state::llvm6309(machine_config &config)
 	rs232.set_option_device_input_defaults("null_modem", DEVICE_INPUT_DEFAULTS_NAME(null_modem));
 
 	// 64K raw-binary cart via generic cart slot — pass with `-rom file.bin`.
-	GENERIC_SOCKET(config, m_cart, generic_plain_slot, "llvm6309_rom", "bin,rom");
+	// ELF32-LE images (the natural lld output) are accepted directly too;
+	// load_cart() detects the magic and lays out PT_LOAD segments at their
+	// VMAs. See bug #222.
+	GENERIC_SOCKET(config, m_cart, generic_plain_slot, "llvm6309_rom", "bin,rom,elf");
 	m_cart->set_device_load(FUNC(llvm6309_state::load_cart));
 	m_cart->set_must_be_loaded(true);
 }
