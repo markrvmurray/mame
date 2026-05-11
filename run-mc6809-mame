@@ -102,33 +102,39 @@ else
     : > "$raw"   # keep trap happy
 fi
 
-# Reset vector: ensure $FFFE-$FFFF holds the address of `_start`.
+# Inject vector slots at known $FFF0-$FFFF locations by looking up the
+# corresponding symbol via llvm-nm. Only fires if the existing cart
+# bytes at the slot are zero (so it doesn't trample an ELF that already
+# emitted a `.vectors` section, as the llvm-mc6809 lit Execution tests
+# do — they use a custom link.ld with `.vectors` LOAD at $FFF0).
 #
-# Two patterns we have to support:
-#   * llvm-mc6809 lit Execution tests use a custom link.ld that emits
-#     a `.vectors` LOAD section at $FFF0; the cart already has the
-#     right bytes at $FFFE.
-#   * picolibc tests use a different linker script that PROVIDEs the
-#     .init entry stub at $FFC0 but does NOT emit .vectors at all,
-#     leaving $FFFE untouched. The ELF entry point is also 0
-#     (because picolibc's link.ld doesn't set ENTRY()), so we can't
-#     use it here either.
+# Picolibc tests use a different linker script that PROVIDEs the .init
+# entry stub at $FFC0 but does NOT emit .vectors at all, leaving the
+# whole $FFF0-$FFFF range zero. The ELF entry point is also 0 (no
+# ENTRY() in picolibc's link.ld), so we can't use that either.
 #
-# Fall back to llvm-nm lookup of the `_start` symbol when the bytes
-# at $FFFE-$FFFF are still zero. Mirrors the same logic in
-# `run-mc6809` (the usim equivalent), which has handled this for
-# picolibc since day one.
-vec_hi=$(dd if="$cart" bs=1 skip=65534 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
-vec_lo=$(dd if="$cart" bs=1 skip=65535 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
-if [ "$vec_hi" = "0" ] && [ "$vec_lo" = "0" ]; then
-    NM="${LLVM_NM:-llvm-nm}"
-    start_addr=$("$NM" "$elf" 2>/dev/null | awk '$3=="_start"{print $1; exit}')
-    if [ -n "$start_addr" ]; then
-        hi_dec=$(( 0x$start_addr >> 8 & 0xFF ))
-        lo_dec=$(( 0x$start_addr & 0xFF ))
-        printf '\\%03o\\%03o' "$hi_dec" "$lo_dec" | xargs -0 printf '%b' | \
-            dd of="$cart" bs=1 seek=65534 count=2 conv=notrunc status=none
-    fi
-fi
+# Slots handled:
+#   $FFFE-$FFFF  reset                   _start
+#   $FFF2-$FFF3  SWI3 (Bug #273)         __swi3_trap (picolibc crt0)
+#
+# Mirrors the same logic in the picolibc `run-mc6809` wrapper, which
+# has done $FFFE injection since day one and $FFF2 injection since
+# Bug #273 landed.
+NM="${LLVM_NM:-llvm-nm}"
+inject_vector() {
+    vec_addr=$1   # decimal offset of the vector's high byte in the cart
+    sym=$2
+    vec_hi=$(dd if="$cart" bs=1 skip=$vec_addr count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+    vec_lo=$(dd if="$cart" bs=1 skip=$((vec_addr+1)) count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+    [ "$vec_hi" = "0" ] && [ "$vec_lo" = "0" ] || return 0
+    addr=$("$NM" "$elf" 2>/dev/null | awk -v s="$sym" '$3==s {print $1; exit}')
+    [ -n "$addr" ] || return 0
+    hi_dec=$(( 0x$addr >> 8 & 0xFF ))
+    lo_dec=$(( 0x$addr & 0xFF ))
+    printf '\\%03o\\%03o' "$hi_dec" "$lo_dec" | xargs -0 printf '%b' | \
+        dd of="$cart" bs=1 seek=$vec_addr count=2 conv=notrunc status=none
+}
+inject_vector 65534 _start         # $FFFE = reset vector
+inject_vector 65522 __swi3_trap    # $FFF2 = SWI3 vector (Bug #273)
 
 exec "$HEADLESS" "$cart" "$timeout"
