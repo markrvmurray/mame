@@ -3,6 +3,7 @@
 # run-mc6809-mame — lit-friendly wrapper around mamellvm6309-headless
 #
 # Usage: run-mc6809-mame <elf> [timeout-seconds]
+#        run-mc6809-mame --debug[=PORT] <elf>          (Bug #258)
 #
 # Drop-in equivalent of `usim09batch <hex>` for HD6309 lit tests:
 #   * accepts an ELF (the natural output of ld.lld),
@@ -12,6 +13,13 @@
 #     usually places it already),
 #   * invokes `mamellvm6309-headless`, returning its stdout/exit
 #     unchanged.
+#
+# Debug mode (`--debug[=PORT]`): launches MAME with `--debug=PORT`
+# (default 2159) and BLOCKS waiting for a gdb/lldb attach.  Installs
+# trap handlers that SIGKILL the MAME PID on EXIT / INT / TERM so
+# the script never leaks an orphan emulator (Bug #258).  Detects
+# stale pidfiles from prior sessions on the same port and reclaims
+# them if their recorded PID is dead.
 #
 # The lowest LOAD VMA (computed via `llvm-readelf -l`) determines where
 # byte 0 of the ELF data lands inside the cart. Naïve `dd seek=0x100`
@@ -28,8 +36,17 @@
 
 set -e
 
+debug_port=""
+case "$1" in
+    --debug)        debug_port="2159"; shift ;;
+    --debug=*)      debug_port="${1#--debug=}"; shift ;;
+esac
+
 if [ $# -lt 1 ]; then
-    echo "usage: run-mc6809-mame <elf> [timeout-seconds]" >&2
+    cat >&2 <<EOF
+usage: run-mc6809-mame <elf> [timeout-seconds]
+       run-mc6809-mame --debug[=PORT] <elf>
+EOF
     exit 1
 fi
 
@@ -137,4 +154,59 @@ inject_vector() {
 inject_vector 65534 _start         # $FFFE = reset vector
 inject_vector 65522 __swi3_trap    # $FFF2 = SWI3 vector (Bug #273)
 
-exec "$HEADLESS" "$cart" "$timeout"
+if [ -z "$debug_port" ]; then
+    # Non-debug fast path: exec MAME headless with the cart-cleanup trap.
+    exec "$HEADLESS" "$cart" "$timeout"
+fi
+
+# ---- debug mode (Bug #258) -------------------------------------------------
+# Pattern that matches "the MAME instance bound to OUR debugger port".
+# Used both for stale-orphan detection at startup and for cleanup on exit.
+# The `mamellvm6309-headless` script spawns mamellvm6309 as a child (no exec)
+# so killing the wrapper PID alone leaves MAME orphaned — match by the
+# unique -debugger_port to find the actual binary regardless of wrapper
+# ancestry.
+mame_pattern="mamellvm6309 .*-debugger_port[ =]$debug_port"
+
+# Reap any prior orphan MAME bound to our port (from a previous session
+# that crashed). pkill returns 0 if anything matched, 1 if not.
+if pgrep -f "$mame_pattern" >/dev/null 2>&1; then
+    echo "run-mc6809-mame: orphan MAME on port $debug_port; reaping" >&2
+    pkill -9 -f "$mame_pattern" 2>/dev/null || true
+    # Brief settle so the port is released.
+    sleep 1
+fi
+
+# Spawn the headless wrapper in the background; it in turn forks MAME.
+"$HEADLESS" --debug="$debug_port" "$cart" &
+wrapper_pid=$!
+
+# Replace the cart-cleanup trap with one that ALSO reaps MAME. SIGKILL
+# (not TERM) because MAME parked in gdbstub-wait ignores TERM (see the
+# session-end notes in mame-gdbstub-debugging.md). Kill the headless
+# wrapper AND any MAME child on our port — pgrep -P would miss MAME if
+# it gets reparented to launchd; matching the port is robust.
+cleanup_debug() {
+    kill -9 "$wrapper_pid" 2>/dev/null || true
+    pkill -9 -f "$mame_pattern" 2>/dev/null || true
+    rm -f "$cart" "$raw"
+}
+trap cleanup_debug EXIT INT TERM
+
+cat <<EOF
+run-mc6809-mame: MAME gdbstub listening on localhost:$debug_port
+                 cart=$cart  wrapper_pid=$wrapper_pid
+                 attach with:
+                   lldb -b -o 'target create $elf' \\
+                              -o 'gdb-remote localhost:$debug_port' \\
+                              -o run
+                 (lldb must be the llvm-mc6809 build; Apple's lldb
+                 rejects MC6809 ELFs — see mame-gdbstub-debugging.md)
+                 use hardware breakpoints (-H); soft-bps misfire.
+                 Ctrl-C this terminal to kill MAME.
+EOF
+
+# Wait for MAME to exit naturally (cart halt at \$FFD2 after lldb detach)
+# or for a signal. The trap fires in both cases.
+wait "$wrapper_pid"
+exit $?
