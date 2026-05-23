@@ -8,11 +8,11 @@
 #   ./mamellvm6309-headless <rom-image> [timeout-seconds]
 #   ./mamellvm6309-headless --debug[=PORT] <rom-image>
 #
-# Serial output goes to stdout. The value written to the exit port ($FFD2)
+# Serial output goes to stdout. The value written to the halt port ($FFCC)
 # becomes the process exit code (0-255).
 #
-# Timeout defaults to 5 seconds (safety net — normal exit is via the $FFD2
-# exit port). Bug #164 (debugger attach):
+# Timeout defaults to 5 seconds (safety net — normal exit is via the $FFCC
+# halt port). Bug #164 (debugger attach):
 #   --debug          starts the gdbstub on port 2159 and runs without timeout.
 #   --debug=NNNN     starts the gdbstub on the specified port instead.
 # Once the gdbstub is listening, attach lldb (preferred) or gdb to it:

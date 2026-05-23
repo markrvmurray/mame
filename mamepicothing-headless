@@ -1,0 +1,67 @@
+#!/bin/sh
+# license:BSD-3-Clause
+# copyright-holders:Mark Murray
+#
+# Headless wrapper for the picothing subtarget on macOS.
+#
+# Usage:
+#   ./mamepicothing-headless <firmware> [timeout-seconds]
+#   ./mamepicothing-headless --debug[=PORT] <firmware>
+#
+# Pico-Thing firmware has no host-exit mechanism, so timeout is the
+# normal termination — the wrapper always exits 124 (timeout) on a
+# clean run unless the gdbstub mode is used.
+#
+# Environment variables passed through to the driver:
+#   PICOTHING_DISK_FILE   path to the PATA IDE backing file
+#   PICOTHING_FRAM_FILE   path to the FRAM persistence file
+#                         (default: picothing.fram in cwd)
+
+set -e
+
+debug_mode=0
+debug_port=2159
+case "${1-}" in
+    --debug)        debug_mode=1; shift ;;
+    --debug=*)      debug_mode=1; debug_port=${1#--debug=}; shift ;;
+esac
+
+if [ $# -lt 1 ]; then
+    echo "usage: mamepicothing-headless [--debug[=PORT]] <firmware> [timeout-seconds]" >&2
+    exit 1
+fi
+
+rom="$1"
+timeout="${2:-5}"
+here=$(dirname "$0")
+
+outfile=$(mktemp /tmp/picothing_out.XXXXXX)
+trap 'rm -f "$outfile"' EXIT
+
+if [ "$debug_mode" -eq 1 ]; then
+    echo "mamepicothing listening for gdb-RSP on localhost:${debug_port}" >&2
+    env SDL_VIDEO_DRIVER=dummy \
+        "${here}/mamepicothing" picothing \
+            -video none -sound none -window -nothrottle \
+            -keyboardprovider none -mouseprovider none \
+            -lightgunprovider none -joystickprovider none \
+            -midiprovider none \
+            -debugger gdbstub -debugger_host localhost -debugger_port "$debug_port" -debug \
+            -skip_gameinfo -noplugins -uifontprovider none \
+            -rom "$rom" \
+            -rs232 null_modem -bitb "$outfile"
+else
+    env SDL_VIDEO_DRIVER=dummy \
+        "${here}/mamepicothing" picothing \
+            -video none -sound none -window -nothrottle \
+            -keyboardprovider none -mouseprovider none \
+            -lightgunprovider none -joystickprovider none \
+            -midiprovider none -debugger none \
+            -skip_gameinfo -noplugins -uifontprovider none \
+            -rom "$rom" \
+            -rs232 null_modem -bitb "$outfile" \
+            -seconds_to_run "$timeout"
+    cat "$outfile"
+fi
+
+exit 124

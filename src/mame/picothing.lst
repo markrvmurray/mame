@@ -1,0 +1,9 @@
+// license:BSD-3-Clause
+// copyright-holders:Mark Murray
+//
+// Driver list for the picothing subtarget — a Pico-Thing MC6809 SBC
+// emulator with DAT MMU, dual ACIA, 50 Hz tick, PATA IDE, FRAM, and
+// SystemWatchpoint. The heavyweight sibling of llvm6309.
+
+@source:homebrew/picothing.cpp
+picothing

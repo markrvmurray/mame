@@ -3,42 +3,41 @@
 
 // Minimal HD6309 single-board computer for validating the llvm-mc6809 backend.
 //
-// Memory map (top-to-bottom — $0000 at the top, $FFFF at the bottom):
-// ----------
-//   $0000-$FFCF   RAM (~64K contiguous — no IO wedge in the middle)
-//   $FFD0-$FFD1   MC6850 ACIA (status, data)
-//   $FFD2         Exit port (write any value → MAME exits cleanly, value
-//                 captured as the process exit code)
-//   $FFD3         TraceCtl (program-controlled host-side logging toggle)
-//   $FFD4-$FFEF   RAM (reserved for future IO)
-//   $FFF0-$FFFF   Vector ROM (reads come from RAM populated at boot, writes
-//                 are dropped so a runaway program can't clobber the reset
-//                 entry)
+// Memory map (top-to-bottom — $0000 at the top, $FFFF at the bottom). IO
+// devices sit in the $FFCx zone, matching the Pico-Thing SBC's hardware
+// layout so a debug-build firmware can target this driver and the
+// `picothing` driver next door with the same MMIO addresses.
 //
-// This layout mirrors the usim09batch simulator (see ../usim) so the same
-// test programs run unchanged on both emulators. The previous $C000 IO
-// overlay with a $C003-$FFFF cart ROM is gone — the machine is now a flat
-// RAM with a tiny IO slab and vector ROM stuck at the bottom, giving test
-// programs ~64 KB of contiguous address space.
+//   $0000-$FFC3   RAM (~64K contiguous — no IO wedge in the middle)
+//   $FFC4-$FFC5   MC6850 ACIA (status, data) — matches PT console ACIA
+//   $FFC6-$FFC9   RAM (no devices wired)
+//   $FFCA         SystemWatchpoint control register (hardware-faithful)
+//   $FFCB         TraceCtl (program-controlled host-side logging toggle)
+//   $FFCC         Halt / exit port — emulator-only; PT has nothing here
+//   $FFCD-$FFDF   RAM
+//   $FFE0-$FFFF   SystemWatchpoint vector + snippet shadow (replaces the
+//                 older write-protected vector ROM). 32-byte window owned
+//                 by the watchpoint device; writable when disarmed.
+//
+// This layout mirrors `usim09batch` (see ../usim) so the same test programs
+// run unchanged on both emulators. The previous map (IO at $FFD0-$FFD3,
+// vectors at $FFF0-$FFFF write-protected by `.nopw()`) is gone.
 //
 // The image is loaded at runtime from a generic cartridge slot. Two
 // formats are accepted:
 //
 //   * Raw binary up to 64 KB (typically a full 64 KB image produced by
 //     `lwasm --format=rawrel` or `llvm-objcopy -O binary --pad-to=0x10000`).
-//     The bytes are memcpy'd into RAM at boot — the bottom 16 bytes
-//     ($FFF0-$FFFF) end up as the reset/IRQ vectors.
+//     The bytes are memcpy'd into RAM at boot — the bottom 32 bytes
+//     ($FFE0-$FFFF) end up in the SystemWatchpoint shadow (vectors plus
+//     reserved snippet area), the rest in RAM.
 //
 //   * ELF32 (the natural output of llvm-mc6809's lld and lwlink — the
-//     llvm-mc6809 toolchain emits big-endian, lwlink either; both
-//     are accepted). Each PT_LOAD program header with FileSiz > 0 is
-//     copied into the 64 KB cart at its VMA. If the reset vector at
-//     $FFFE-$FFFF is still zero after all segments are placed, it is
-//     patched with the `_start` symbol's value (looked up in
-//     `.symtab`). This mirrors what the `run-mc6809-mame` shell
-//     wrapper used to do externally via objcopy + nm + dd, so
-//     debug-mode (`--debug=PORT`) and non-debug invocations both
-//     accept ELFs with no preprocessing.
+//     llvm-mc6809 toolchain emits big-endian, lwlink either; both are
+//     accepted). Each PT_LOAD program header with FileSiz > 0 is copied
+//     into the 64 KB cart at its VMA. If the reset vector at $FFFE-$FFFF
+//     is still zero after all segments are placed, it is patched with the
+//     `_start` symbol's value (looked up in `.symtab`).
 //
 // Typical LLVM execution-test invocation (via the mamellvm6309-headless
 // wrapper):
@@ -46,7 +45,7 @@
 //   mamellvm6309-headless test.bin 2
 //   FileCheck %s < /tmp/out.txt
 //
-// The test program ends with `sta $FFD2` which schedules a clean exit
+// The test program ends with `sta $FFCC` which schedules a clean exit
 // ~2 ms later (enough time for the ACIA TX shift register to drain),
 // and the value stored becomes the process exit code.
 //
@@ -85,11 +84,28 @@ public:
 
 protected:
 	virtual void machine_start() override ATTR_COLD;
+	virtual void machine_reset() override ATTR_COLD;
 
 private:
+	// SystemWatchpoint constants — mirror usim's `system_watchpoint.h`.
+	static constexpr u16 SWP_WINDOW_BASE   = 0xFFE0;
+	static constexpr u16 SWP_WINDOW_SIZE   = 0x0020;
+	static constexpr u16 SWP_NMI_OFFSET    = 0xFFFC - SWP_WINDOW_BASE;
+	static constexpr u16 SWP_SNIPPET_LEN   = 0x10;
+	static const u8      SWP_BREAK_SNIPPET[SWP_SNIPPET_LEN];
+
 	void mem_map(address_map &map) ATTR_COLD;
-	void exit_w(u8 data);
+
+	void halt_w(u8 data);
 	void tracectl_w(u8 data);
+	void swp_ctrl_w(u8 data);
+	u8   swp_vec_r(offs_t offset);
+	void swp_vec_w(offs_t offset, u8 data);
+
+	void swp_arm();
+	void swp_disarm();
+	void swp_trigger(u16 offending_addr);
+
 	TIMER_CALLBACK_MEMBER(do_exit);
 	std::pair<std::error_condition, std::string> load_cart(device_image_interface &image);
 
@@ -97,9 +113,39 @@ private:
 	required_device<acia6850_device> m_acia;
 	required_device<generic_slot_device> m_cart;
 	required_shared_ptr<u8> m_mem;
+
 	emu_timer *m_exit_timer = nullptr;
 	u8 m_exit_code = 0;
 	bool m_trace_enabled = false;
+
+	u8   m_swp_shadow[SWP_WINDOW_SIZE]{};
+	bool m_swp_armed = false;
+	u8   m_swp_saved_nmi_hi = 0xff;
+	u8   m_swp_saved_nmi_lo = 0xff;
+};
+
+// BREAK snippet — copied to $FFE0-$FFEF when the watchpoint is armed.
+// Same 16 bytes as usim's `system_watchpoint.cpp`. The 6809 NMI auto-
+// pushes the full register frame (PC,U,Y,X,DP,B,A,CC), and the snippet
+// copies the 12-byte trapped frame to SHARED ($FFD0) and spins.
+//
+//   FFE0: 30 E4         LEAX 0,S
+//   FFE2: CE FF D0      LDU  #$FFD0
+//   FFE5: 86 0C         LDA  #12
+//   FFE7: E6 80   loop: LDB  ,X+
+//   FFE9: E7 C0         STB  ,U+
+//   FFEB: 4A            DECA
+//   FFEC: 26 F9         BNE  loop
+//   FFEE: 20 FE   spin: BRA  spin
+const u8 llvm6309_state::SWP_BREAK_SNIPPET[SWP_SNIPPET_LEN] = {
+	0x30, 0xE4,
+	0xCE, 0xFF, 0xD0,
+	0x86, 0x0C,
+	0xE6, 0x80,
+	0xE7, 0xC0,
+	0x4A,
+	0x26, 0xF9,
+	0x20, 0xFE
 };
 
 void llvm6309_state::machine_start()
@@ -109,20 +155,36 @@ void llvm6309_state::machine_start()
 	// Populate RAM from the cart image. The cart slot always allocates
 	// exactly 64 KB (load_cart() pads .bin and lays out ELF PT_LOAD
 	// segments into a fixed-size buffer). Copy the whole 64 KB into
-	// the "mem" share so byte N of the cart ends up at address $N.
-	// The bottom 16 bytes ($FFF0-$FFFF) end up as the reset/IRQ
-	// vectors — reads go through normal RAM, but the .nopw() overlay
-	// in mem_map drops any subsequent writes so a runaway program
-	// can't clobber the reset entry.
+	// the "mem" share — IO overlays in mem_map intercept the IO and
+	// watchpoint ranges, so the bytes loaded into RAM at those
+	// addresses are simply unused.
 	u8 const *src = m_cart->get_rom_base();
 	if (src != nullptr)
+	{
 		std::memcpy(&m_mem[0], src, 0x10000);
+		// Seed the SystemWatchpoint shadow from the cart's vector
+		// region. The reset vector at $FFFE-$FFFF is what tells the
+		// CPU where to start; load_cart() either copied it from the
+		// raw image or patched it from `_start` for ELFs with no
+		// .vectors LOAD segment.
+		std::memcpy(m_swp_shadow, src + SWP_WINDOW_BASE, SWP_WINDOW_SIZE);
+	}
 
 	save_item(NAME(m_exit_code));
 	save_item(NAME(m_trace_enabled));
+	save_item(NAME(m_swp_shadow));
+	save_item(NAME(m_swp_armed));
+	save_item(NAME(m_swp_saved_nmi_hi));
+	save_item(NAME(m_swp_saved_nmi_lo));
 }
 
-void llvm6309_state::exit_w(u8 data)
+void llvm6309_state::machine_reset()
+{
+	// CPU reset disarms the watchpoint (matches usim's ActiveDevice::reset).
+	swp_disarm();
+}
+
+void llvm6309_state::halt_w(u8 data)
 {
 	// Any write here ends the emulation run cleanly. The actual exit is
 	// deferred by ~2 ms so any byte still being shifted out of the ACIA's
@@ -166,6 +228,94 @@ void llvm6309_state::tracectl_w(u8 data)
 			logerror("TraceCtl: %02X at PC=%04X\n", data, m_maincpu->pc());
 		break;
 	}
+}
+
+void llvm6309_state::swp_ctrl_w(u8 data)
+{
+	if (data)
+		swp_arm();
+	else
+		swp_disarm();
+}
+
+u8 llvm6309_state::swp_vec_r(offs_t offset)
+{
+	if (offset < SWP_WINDOW_SIZE)
+		return m_swp_shadow[offset];
+	return 0xff;
+}
+
+void llvm6309_state::swp_vec_w(offs_t offset, u8 data)
+{
+	if (offset >= SWP_WINDOW_SIZE)
+		return;
+
+	if (m_swp_armed)
+	{
+		// Block the store; assert NMI; don't auto-disarm here. The CPU
+		// is about to vector to the snippet at $FFE0 (the swapped NMI
+		// vector points there); the snippet copies the trapped frame
+		// to SHARED ($FFD0) and spins. Disarm only on explicit write
+		// of 0 to $FFCA, or on machine_reset().
+		swp_trigger(u16(SWP_WINDOW_BASE + offset));
+		return;
+	}
+
+	m_swp_shadow[offset] = data;
+}
+
+void llvm6309_state::swp_arm()
+{
+	if (m_swp_armed)
+		return; // idempotent
+
+	// Save the current NMI vector from the shadow.
+	m_swp_saved_nmi_hi = m_swp_shadow[SWP_NMI_OFFSET];
+	m_swp_saved_nmi_lo = m_swp_shadow[SWP_NMI_OFFSET + 1];
+
+	// Copy the BREAK snippet over $FFE0-$FFEF.
+	std::memcpy(m_swp_shadow, SWP_BREAK_SNIPPET, SWP_SNIPPET_LEN);
+
+	// Repoint the NMI vector to $FFE0.
+	m_swp_shadow[SWP_NMI_OFFSET]     = u8(SWP_WINDOW_BASE >> 8);
+	m_swp_shadow[SWP_NMI_OFFSET + 1] = u8(SWP_WINDOW_BASE & 0xff);
+
+	m_swp_armed = true;
+}
+
+void llvm6309_state::swp_disarm()
+{
+	if (!m_swp_armed)
+	{
+		// Even when never armed, release NMI in case we're being
+		// called from machine_reset() right after a trigger.
+		m_maincpu->set_input_line(INPUT_LINE_NMI, CLEAR_LINE);
+		return;
+	}
+
+	// Restore the saved NMI vector. Snippet bytes are intentionally
+	// left in place — matches the hardware where the Pico's BREAK
+	// snippet stays resident until the next firmware-load cycle.
+	m_swp_shadow[SWP_NMI_OFFSET]     = m_swp_saved_nmi_hi;
+	m_swp_shadow[SWP_NMI_OFFSET + 1] = m_swp_saved_nmi_lo;
+
+	m_swp_armed = false;
+	m_maincpu->set_input_line(INPUT_LINE_NMI, CLEAR_LINE);
+}
+
+void llvm6309_state::swp_trigger(u16 offending_addr)
+{
+	// Visibility: emulator-side dump so users see the trap before the
+	// snippet copies the frame to SHARED. Doesn't affect guest state.
+	logerror("SystemWatchpoint: write to $%04X blocked while armed; "
+		"asserting NMI (PC=$%04X)\n",
+		offending_addr, m_maincpu->pc());
+
+	// Assert NMI. The CPU latches NMI on the falling edge and services
+	// it once; subsequent writes to the protected window within the
+	// same armed window won't re-fire until disarm releases NMI and a
+	// fresh arm + trigger occurs.
+	m_maincpu->set_input_line(INPUT_LINE_NMI, ASSERT_LINE);
 }
 
 TIMER_CALLBACK_MEMBER(llvm6309_state::do_exit)
@@ -355,8 +505,8 @@ std::pair<std::error_condition, std::string> llvm6309_state::load_cart(device_im
 	slot.common_load_rom(&raw[0], size, "rom");
 
 	// Allocate the 64 KB cart and zero-fill. ELF segments leave gaps
-	// (e.g. between .text at $0100 and .vectors at $FFF0); the gaps
-	// must be zero so the IO slab at $FFD0+ works correctly.
+	// (e.g. between .text at $0100 and .vectors at $FFE0); the gaps
+	// must be zero so the IO slab at $FFCx works correctly.
 	slot.rom_alloc(0x10000, GENERIC_ROM8_WIDTH, ENDIANNESS_BIG);
 	u8 *const cart = slot.get_rom_base();
 	std::memset(cart, 0, 0x10000);
@@ -375,19 +525,23 @@ std::pair<std::error_condition, std::string> llvm6309_state::load_cart(device_im
 void llvm6309_state::mem_map(address_map &map)
 {
 	// Unified ~64 KB RAM. Test programs see a flat contiguous address
-	// space from $0000 down to $FFCF with no IO wedge in the middle.
+	// space from $0000 down to $FFC3 with no IO wedge in the middle.
 	map(0x0000, 0xffff).ram().share("mem");
 
-	// IO slab at the bottom, just above the vectors. These .rw()/.w()
+	// IO slab in the $FFCx zone, matching pico-thing's hardware layout
+	// so a debug-build firmware can target both this driver and the
+	// `picothing` driver with the same MMIO addresses. These .rw()/.w()
 	// entries override the RAM mapping for their ranges (later wins).
-	map(0xffd0, 0xffd1).rw(m_acia, FUNC(acia6850_device::read), FUNC(acia6850_device::write));
-	map(0xffd2, 0xffd2).w(FUNC(llvm6309_state::exit_w));
-	map(0xffd3, 0xffd3).w(FUNC(llvm6309_state::tracectl_w));
+	map(0xffc4, 0xffc5).rw(m_acia, FUNC(acia6850_device::read), FUNC(acia6850_device::write));
+	map(0xffca, 0xffca).w(FUNC(llvm6309_state::swp_ctrl_w));
+	map(0xffcb, 0xffcb).w(FUNC(llvm6309_state::tracectl_w));
+	map(0xffcc, 0xffcc).w(FUNC(llvm6309_state::halt_w));
 
-	// Vectors at $FFF0-$FFFF: reads still come from the underlying RAM
-	// (populated from the cart at machine_start), but writes are silently
-	// dropped so a runaway program can't clobber the reset entry.
-	map(0xfff0, 0xffff).nopw();
+	// SystemWatchpoint vector + snippet shadow at $FFE0-$FFFF — the
+	// device owns the 32-byte window. Reads return shadow bytes; writes
+	// either land in the shadow (disarmed) or are blocked and assert
+	// NMI (armed). Replaces the older write-protected vector ROM.
+	map(0xffe0, 0xffff).rw(FUNC(llvm6309_state::swp_vec_r), FUNC(llvm6309_state::swp_vec_w));
 }
 
 // null_modem defaults to 9600 baud. Our ACIA drives at 115200, so the
