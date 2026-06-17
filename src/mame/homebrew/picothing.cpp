@@ -66,6 +66,19 @@
 #include <string>
 #include <vector>
 
+// Stage G: --aux-pty needs POSIX openpty()/forkpty(). util.h is the
+// macOS / BSD location; util.h on Linux as well via libutil. Wrap in
+// __unix__ so non-Unix builds compile (MAME also targets Windows).
+#if defined(__unix__) || defined(__APPLE__)
+#  include <util.h>
+#  include <fcntl.h>
+#  include <unistd.h>
+#  include <termios.h>
+#  define PICOTHING_HAVE_PTY 1
+#else
+#  define PICOTHING_HAVE_PTY 0
+#endif
+
 #include "bus/generic/carts.h"
 #include "bus/generic/slot.h"
 #include "bus/rs232/rs232.h"
@@ -333,6 +346,28 @@ private:
 	void detect_dbl_scan();
 	void install_trace_opcode_tap_for_detectors();
 	bool in_kernel_mode() const { return (m_maincpu->state_int(M6809_CC) & 0x80) == 0; }
+
+	// Stage G: deterministic console input + aux-PTY backing.
+	std::vector<u8> m_input_bytes;
+	u64 m_input_first_cyc = 30'000'000;
+	u64 m_input_step_cyc  = 200'000;
+	size_t m_input_idx = 0;
+	int m_input_bit = -1;     // -1 = waiting; 0 = start; 1..8 = data; 9 = stop
+	emu_timer *m_input_timer = nullptr;
+	emu_timer *m_aux_pty_timer = nullptr;
+	int m_aux_pty_master = -1;
+	std::string m_aux_pty_slave;
+	// Aux-pty TX byte assembly (collected from the aux ACIA's TX bits).
+	u8  m_aux_tx_byte = 0;
+	int m_aux_tx_bit = -1;
+	// Aux-pty RX byte feeder (current byte being clocked into the ACIA).
+	u8  m_aux_rx_byte = 0;
+	int m_aux_rx_bit = -1;
+	void parse_input_string(const char *src);
+	TIMER_CALLBACK_MEMBER(input_tick);
+	TIMER_CALLBACK_MEMBER(aux_pty_tick);
+	void aux_pty_open();
+	void aux_pty_close();
 
 	// Stage F: --shadow, --pc-hist, crash post-mortem.
 	void emit_pc_hist();
@@ -1738,6 +1773,155 @@ void picothing_state::emit_post_mortem(const char *trigger, u16 pc)
 
 
 //------------------------------------------------------------
+// Stage G: --input deterministic console RX + --aux-pty backing
+//
+// --input=STR    decoded with \r \n \t \0 \\ escapes; clocked into
+//                the console ACIA's RX line at the configured cycle
+//                schedule (--input-first, --input-step) one byte
+//                per step. Each byte is shifted onto write_rxd as a
+//                10-bit serial frame (start=0, 8 data LSB-first,
+//                stop=1) at the 115200 baud bit rate (≈8.68 CPU
+//                cycles per bit at 1 MHz E).
+// --aux-pty      opens a POSIX PTY pair, prints the slave path
+//                (/dev/ttysNNN on macOS) to stderr at startup, then
+//                bridges the aux ACIA TX/RX to the PTY master end.
+//                External programs (DriveWire, screen, etc.) attach
+//                to the slave to interact with the guest.
+//------------------------------------------------------------
+
+void picothing_state::parse_input_string(const char *src)
+{
+	m_input_bytes.clear();
+	if (!src) return;
+	for (const char *p = src; *p; p++)
+	{
+		if (*p == '\\' && p[1])
+		{
+			char const c = *++p;
+			switch (c)
+			{
+			case 'r':  m_input_bytes.push_back(0x0d); break;
+			case 'n':  m_input_bytes.push_back(0x0a); break;
+			case 't':  m_input_bytes.push_back(0x09); break;
+			case '0':  m_input_bytes.push_back(0x00); break;
+			case '\\': m_input_bytes.push_back('\\'); break;
+			default:   m_input_bytes.push_back(u8(c)); break;
+			}
+		}
+		else
+		{
+			m_input_bytes.push_back(u8(*p));
+		}
+	}
+}
+
+TIMER_CALLBACK_MEMBER(picothing_state::input_tick)
+{
+	// Wait until the configured first-byte cycle before starting.
+	if (cur_cycles() < m_input_first_cyc) return;
+	if (m_input_idx >= m_input_bytes.size()) return;
+
+	// Frame state machine: -1 = idle (start new byte), 0 = start bit,
+	// 1..8 = data bits (LSB first), 9 = stop bit, then idle.
+	if (m_input_bit < 0)
+	{
+		m_input_bit = 0;
+		m_acia_con->write_rxd(0);     // start bit (low)
+		return;
+	}
+	if (m_input_bit == 9)
+	{
+		m_acia_con->write_rxd(1);     // stop bit (high)
+		m_input_bit = -1;
+		m_input_idx++;
+		// Reschedule the NEXT byte at first + step * idx instead of
+		// just the next bit. Quietly idle in between to let the ACIA
+		// register settle.
+		u64 const next = m_input_first_cyc + m_input_idx * m_input_step_cyc;
+		u64 const now = cur_cycles();
+		attotime const wait = (next > now)
+			? attotime::from_ticks(next - now, m_maincpu->clock())
+			: attotime::from_ticks(1, m_maincpu->clock());
+		m_input_timer->adjust(wait);
+		return;
+	}
+	if (m_input_bit < 9)
+	{
+		// Data bit n (1..8): bit (n-1) of the current byte, LSB first.
+		u8 const byte = m_input_bytes[m_input_idx];
+		int const bit_val = (byte >> (m_input_bit - 1)) & 1;
+		m_input_bit++;
+		m_acia_con->write_rxd(bit_val ? 1 : 0);
+	}
+}
+
+void picothing_state::aux_pty_open()
+{
+#if PICOTHING_HAVE_PTY
+	int master = -1, slave = -1;
+	char name[256] = {0};
+	if (openpty(&master, &slave, name, nullptr, nullptr) != 0)
+	{
+		logerror("picothing: openpty() failed\n");
+		return;
+	}
+	// Slave side is left open so the kernel doesn't reap the PTY on
+	// peer disconnect — external clients can attach/detach freely.
+	(void)slave;
+	int flags = fcntl(master, F_GETFL, 0);
+	if (flags >= 0) fcntl(master, F_SETFL, flags | O_NONBLOCK);
+	m_aux_pty_master = master;
+	m_aux_pty_slave = name;
+	std::fprintf(stderr, "picothing: aux-PTY slave = %s\n", name);
+	// Wire TX from aux ACIA into the PTY master: every TXD bit
+	// arrives via the rs232 wiring; we collect bits into bytes here.
+	// (See machine_start for the actual handler hook-up.)
+#else
+	logerror("picothing: --aux-pty not supported on this platform\n");
+#endif
+}
+
+void picothing_state::aux_pty_close()
+{
+#if PICOTHING_HAVE_PTY
+	if (m_aux_pty_master >= 0)
+	{
+		close(m_aux_pty_master);
+		m_aux_pty_master = -1;
+	}
+#endif
+}
+
+TIMER_CALLBACK_MEMBER(picothing_state::aux_pty_tick)
+{
+#if PICOTHING_HAVE_PTY
+	if (m_aux_pty_master < 0) return;
+	// Pull any pending bytes from the PTY master and clock them
+	// into the aux ACIA RX. State machine matches input_tick's.
+	if (m_aux_rx_bit < 0)
+	{
+		u8 b;
+		ssize_t const n = read(m_aux_pty_master, &b, 1);
+		if (n != 1) return;
+		m_aux_rx_byte = b;
+		m_aux_rx_bit = 0;
+		m_acia_aux->write_rxd(0);     // start bit
+		return;
+	}
+	if (m_aux_rx_bit == 9)
+	{
+		m_acia_aux->write_rxd(1);     // stop bit
+		m_aux_rx_bit = -1;
+		return;
+	}
+	int const bit_val = (m_aux_rx_byte >> (m_aux_rx_bit)) & 1;
+	m_aux_rx_bit++;
+	m_acia_aux->write_rxd(bit_val ? 1 : 0);
+#endif
+}
+
+
+//------------------------------------------------------------
 // Firmware loading — raw / Intel HEX / S-record / ELF
 //------------------------------------------------------------
 
@@ -2115,6 +2299,72 @@ void picothing_state::machine_start()
 		}
 	}
 
+	// Stage G: --input deterministic console RX + --aux-pty.
+	if (const char *in = std::getenv("PICOTHING_INPUT"))
+	{
+		parse_input_string(in);
+		if (const char *f = std::getenv("PICOTHING_INPUT_FIRST"))
+			m_input_first_cyc = parse_u64_env(f, m_input_first_cyc);
+		if (const char *s = std::getenv("PICOTHING_INPUT_STEP"))
+			m_input_step_cyc = parse_u64_env(s, m_input_step_cyc);
+		// Bit rate: 115200 baud, ACIA clock 1.8432 MHz / 16. At 1 MHz
+		// E that's ~8.68 CPU cycles per bit. Round to 9 — close enough
+		// for the ACIA's /16 oversampling to clock each frame correctly.
+		m_input_timer = timer_alloc(FUNC(picothing_state::input_tick), this);
+		// Idle high until the first byte due cycle.
+		m_acia_con->write_rxd(1);
+		// Fire repeatedly at the bit rate; per-byte spacing is enforced
+		// inside input_tick by inserting a one-shot delay before each
+		// start bit.
+		m_input_timer->adjust(
+			attotime::from_ticks(m_input_first_cyc, m_maincpu->clock()),
+			0,
+			attotime::from_ticks(9, m_maincpu->clock()));
+		logerror("picothing: --input loaded %u bytes, first=%llu step=%llu\n",
+			unsigned(m_input_bytes.size()),
+			(unsigned long long)m_input_first_cyc,
+			(unsigned long long)m_input_step_cyc);
+	}
+	if (std::getenv("PICOTHING_AUX_PTY"))
+	{
+		aux_pty_open();
+		if (m_aux_pty_master >= 0)
+		{
+			m_acia_aux->write_rxd(1);     // idle high
+			m_aux_pty_timer = timer_alloc(FUNC(picothing_state::aux_pty_tick), this);
+			m_aux_pty_timer->adjust(
+				attotime::from_ticks(9, m_maincpu->clock()),
+				0,
+				attotime::from_ticks(9, m_maincpu->clock()));
+			// Hook the aux ACIA TXD output to feed the PTY master.
+			m_acia_aux->txd_handler().append([this](int state)
+			{
+#if PICOTHING_HAVE_PTY
+				// Reassemble bits into bytes on the falling edge of
+				// the start bit, then accumulate 8 data bits, then
+				// write the byte to the master fd on the stop bit.
+				if (m_aux_tx_bit < 0)
+				{
+					if (state == 0) { m_aux_tx_bit = 0; m_aux_tx_byte = 0; }
+					return;
+				}
+				if (m_aux_tx_bit < 8)
+				{
+					m_aux_tx_byte |= u8((state ? 1 : 0) << m_aux_tx_bit);
+					m_aux_tx_bit++;
+					return;
+				}
+				// Stop bit — write the byte and reset.
+				if (m_aux_pty_master >= 0)
+					(void)write(m_aux_pty_master, &m_aux_tx_byte, 1);
+				m_aux_tx_bit = -1;
+#else
+				(void)state;
+#endif
+			});
+		}
+	}
+
 	// Stage F: --shadow and --pc-hist allocation.
 	if (std::getenv("PICOTHING_SHADOW"))
 	{
@@ -2160,6 +2410,7 @@ void picothing_state::machine_exit_notify()
 	// PC histogram is interesting on every clean exit, not just
 	// crashes — it answers "where did this run spend its time?".
 	emit_pc_hist();
+	aux_pty_close();
 }
 
 void picothing_state::machine_reset()
