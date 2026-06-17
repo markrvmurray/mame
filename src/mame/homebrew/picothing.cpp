@@ -333,6 +333,26 @@ private:
 	void detect_dbl_scan();
 	void install_trace_opcode_tap_for_detectors();
 	bool in_kernel_mode() const { return (m_maincpu->state_int(M6809_CC) & 0x80) == 0; }
+
+	// Stage F: --shadow, --pc-hist, crash post-mortem.
+	void emit_pc_hist();
+	void emit_post_mortem(const char *trigger, u16 pc);
+	// Per-byte last-writer ring on the 2 MB physical store: 8 bytes
+	// per entry (PC: 2, cycle: 6 = packed 48-bit). ~16 MB at full
+	// resolution; we use a compact 6-byte struct.
+	struct shadow_entry { u16 pc; u32 cyc_low; };
+	std::unique_ptr<shadow_entry[]> m_shadow;
+	bool m_shadow_enabled = false;
+	// PC histogram (64K entries, one counter per PC).
+	std::unique_ptr<u32[]> m_pc_hist;
+	bool m_pc_hist_enabled = false;
+	u64  m_pc_hist_from = 0;
+	unsigned m_pc_hist_top_n = 24;
+	// Last 256 PCs (ring buffer) for post-mortem control-flow trace.
+	static constexpr unsigned PC_RING_LEN = 256;
+	u16  m_pc_ring[PC_RING_LEN]{};
+	unsigned m_pc_ring_head = 0;
+	u64  m_pc_ring_count = 0;
 };
 
 // BREAK snippet — copied to $FFE0-$FFEF when the watchpoint is armed.
@@ -939,6 +959,14 @@ u8 picothing_state::peek_physical(u32 phys) const
 
 void picothing_state::on_physical_write(u32 phys, u8 old_val, u8 new_val, offs_t logical)
 {
+	// --shadow: stamp the per-byte last-writer ring first so the
+	// post-mortem can read it even for stores that don't match any
+	// wlog/watch/detector spec.
+	if (m_shadow_enabled && phys < DAT_PHYS_SIZE)
+	{
+		m_shadow[phys].pc = cur_pc();
+		m_shadow[phys].cyc_low = u32(cur_cycles());
+	}
 	for (auto const &w : m_wlogs)
 	{
 		if (w.physical && phys >= w.base && phys < w.base + w.len)
@@ -1198,6 +1226,15 @@ void picothing_state::trace_procs_hook(u16 pc)
 void picothing_state::on_instruction(u16 pc)
 {
 	m_inst_count++;
+
+	// PC ring + histogram are unconditional once enabled — kept tight
+	// because they fire on EVERY instruction. The histogram allocates
+	// 256 KB lazily; the ring is a 512-byte buffer.
+	m_pc_ring[m_pc_ring_head] = pc;
+	m_pc_ring_head = (m_pc_ring_head + 1) % PC_RING_LEN;
+	m_pc_ring_count++;
+	if (m_pc_hist_enabled && m_inst_count >= m_pc_hist_from)
+		m_pc_hist[pc]++;
 
 	// Task filter: if set, suppress both trace and brk when the
 	// active utask TCB doesn't match.
@@ -1500,15 +1537,16 @@ void picothing_state::run_detectors_on_instruction(u16 pc)
 			(unsigned long long)cur_cycles(), unsigned(pc));
 	}
 	// trap-sled: first wild control transfer onto a $00 sled (PC==0
-	// from non-trampoline code). One-shot.
+	// from non-trampoline code). One-shot — also calls the Stage F
+	// 6-section post-mortem.
 	if (m_trap_sled && !m_sled_fired && pc == 0x0000)
 	{
 		m_sled_fired = true;
 		std::fprintf(stderr,
 			"TRAP-SLED first wild transfer to PC=$0000 task=%u cyc=%llu\n",
 			unsigned(m_dat_task), (unsigned long long)cur_cycles());
-		emit_register_dump("TRAP-SLED-REGS", pc);
 		instrumentation_dump_all("trap-sled");
+		emit_post_mortem("trap-sled", pc);
 	}
 	// trap-spin: dense IRQ ($E400) / SWI3 ($E42F) trampoline entries
 	// within a TRAP_SPIN_WINDOW-instruction window.
@@ -1528,14 +1566,174 @@ void picothing_state::run_detectors_on_instruction(u16 pc)
 					"TRAP-SPIN %u trampoline hits in %u-insn window cyc=%llu pc=$%04X\n",
 					m_spin_window_hits, TRAP_SPIN_WINDOW,
 					(unsigned long long)cur_cycles(), unsigned(pc));
-				emit_register_dump("TRAP-SPIN-REGS", pc);
 				instrumentation_dump_all("trap-spin");
+				emit_post_mortem("trap-spin", pc);
 				m_trap_spin = false;     // one-shot
 			}
 		}
 	}
 	// detect-dbl: periodic page double-allocation scan.
 	if (m_detect_dbl) detect_dbl_scan();
+}
+
+
+//------------------------------------------------------------
+// Stage F: --shadow / --pc-hist / crash post-mortem
+//
+// --shadow: per-byte last-writer ring on the 2 MB physical store
+//           (PC + cycle-low). ~16 MB total; allocated only when
+//           PICOTHING_SHADOW is set.
+// --pc-hist[=N]: 64 KB counter table; on exit, adjacent hot PCs
+//           (gap <= 8 bytes) merge into clusters and the top N
+//           are printed.
+// Crash post-mortem: 6-section dump triggered by trap-sled and
+//           trap-spin (and also by machine_exit_notify if any
+//           detector requested it).
+//------------------------------------------------------------
+
+void picothing_state::emit_pc_hist()
+{
+	if (!m_pc_hist_enabled) return;
+	struct cluster { u16 lo, hi; u64 count; };
+	std::vector<cluster> clusters;
+	cluster cur{0, 0, 0};
+	bool in_cluster = false;
+	u16 last_pc = 0;
+	for (u32 a = 0; a < 0x10000; a++)
+	{
+		u32 const cnt = m_pc_hist[a];
+		if (cnt == 0) continue;
+		if (!in_cluster)
+		{
+			cur = { u16(a), u16(a), cnt };
+			in_cluster = true;
+		}
+		else if (u32(a) - u32(last_pc) <= 8)
+		{
+			cur.hi = u16(a);
+			cur.count += cnt;
+		}
+		else
+		{
+			clusters.push_back(cur);
+			cur = { u16(a), u16(a), cnt };
+		}
+		last_pc = u16(a);
+	}
+	if (in_cluster) clusters.push_back(cur);
+	if (clusters.empty()) return;
+	std::sort(clusters.begin(), clusters.end(),
+		[](cluster const &a, cluster const &b) { return a.count > b.count; });
+	u64 total = 0;
+	for (auto const &c : clusters) total += c.count;
+	std::fprintf(stderr, "--- PC-HIST (top %u of %u clusters, total %llu samples) ---\n",
+		unsigned(std::min(size_t(m_pc_hist_top_n), clusters.size())),
+		unsigned(clusters.size()), (unsigned long long)total);
+	for (unsigned i = 0; i < std::min(size_t(m_pc_hist_top_n), clusters.size()); i++)
+	{
+		auto const &c = clusters[i];
+		double const pct = total ? (double(c.count) * 100.0 / double(total)) : 0.0;
+		if (c.lo == c.hi)
+			std::fprintf(stderr, "  $%04X            count=%llu  %.2f%%\n",
+				unsigned(c.lo), (unsigned long long)c.count, pct);
+		else
+			std::fprintf(stderr, "  $%04X-$%04X     count=%llu  %.2f%%\n",
+				unsigned(c.lo), unsigned(c.hi),
+				(unsigned long long)c.count, pct);
+	}
+}
+
+void picothing_state::emit_post_mortem(const char *trigger, u16 pc)
+{
+	std::fprintf(stderr, "\n========== picothing post-mortem (%s) ==========\n",
+		trigger ? trigger : "exit");
+	// (1) Registers.
+	emit_register_dump("POST-REGS", pc);
+
+	// (2) DAT state — active task + table for all tasks.
+	std::fprintf(stderr, "DAT  active=%u  table:\n", unsigned(m_dat_task));
+	for (unsigned t = 0; t < DAT_TASKS; t++)
+	{
+		std::fprintf(stderr, "  task %2u :", t);
+		for (unsigned p = 0; p < DAT_PAGES_PER_TASK; p++)
+			std::fprintf(stderr, " %02X", unsigned(m_dat_table[t * 8 + p]));
+		std::fprintf(stderr, "\n");
+	}
+
+	// (3) Slot-0 page of the active task (first 64 bytes — usually
+	// the reset / direct-page area).
+	std::fprintf(stderr, "Slot-0 page (first 64 bytes):\n");
+	{
+		addr_spec spec{ false, 0x0000, 64, 0 };
+		instrumentation_dump_one(spec);
+	}
+
+	// (4) Stack frame — $S-16 .. $S+47.
+	u16 const s = u16(m_maincpu->state_int(M6809_S) & 0xffff);
+	u32 const slo = (s >= 16) ? u32(s - 16) : 0;
+	u32 const slen = std::min<u32>(0x10000 - slo, 64);
+	std::fprintf(stderr, "Stack frame around S=$%04X:\n", unsigned(s));
+	{
+		addr_spec spec{ false, slo, slen, 0 };
+		instrumentation_dump_one(spec);
+	}
+
+	// (5) Last-writer for the resume-PC stack slot ($S, $S+1) — only
+	// meaningful if --shadow is enabled.
+	if (m_shadow_enabled && s < 0xfe00)
+	{
+		// Resolve $S through the active DAT mapping to phys.
+		u8 const page_idx = (m_dat_task << 3) | u8(s >> 13);
+		u8 const phys_pg  = m_dat_table[page_idx];
+		if (phys_pg != DAT_PAGE_UNAVAILABLE)
+		{
+			u32 const phys_s = (u32(phys_pg) << 13) | (s & 0x1fff);
+			std::fprintf(stderr, "Last writer at $S (phys=$%05X) "
+				"pc=$%04X cyc-low=%u\n",
+				unsigned(phys_s),
+				unsigned(m_shadow[phys_s].pc),
+				unsigned(m_shadow[phys_s].cyc_low));
+			std::fprintf(stderr, "Last writer at $S+1 (phys=$%05X) "
+				"pc=$%04X cyc-low=%u\n",
+				unsigned(phys_s + 1),
+				unsigned(m_shadow[phys_s + 1].pc),
+				unsigned(m_shadow[phys_s + 1].cyc_low));
+		}
+	}
+
+	// (6) PC ring — last PC_RING_LEN PCs in execution order.
+	std::fprintf(stderr, "PC ring (last %u PCs, oldest first):\n",
+		unsigned(std::min<u64>(m_pc_ring_count, PC_RING_LEN)));
+	u64 const have = std::min<u64>(m_pc_ring_count, PC_RING_LEN);
+	unsigned start = (m_pc_ring_count <= PC_RING_LEN)
+		? 0 : m_pc_ring_head;
+	for (u64 i = 0; i < have; i++)
+	{
+		unsigned idx = (start + i) % PC_RING_LEN;
+		std::fprintf(stderr, " %04X", unsigned(m_pc_ring[idx]));
+		if ((i & 15) == 15) std::fprintf(stderr, "\n");
+	}
+	if (have & 15) std::fprintf(stderr, "\n");
+
+	// (7) Control-flow discontinuities in the ring — adjacent PCs
+	// that differ by more than 5 (heuristic for "jumped").
+	std::fprintf(stderr, "Control-flow discontinuities (delta > 5):\n");
+	for (u64 i = 1; i < have; i++)
+	{
+		unsigned ia = (start + i - 1) % PC_RING_LEN;
+		unsigned ib = (start + i) % PC_RING_LEN;
+		u16 const a = m_pc_ring[ia];
+		u16 const b = m_pc_ring[ib];
+		int const d = int(b) - int(a);
+		if (d < -5 || d > 5)
+			std::fprintf(stderr, "  $%04X -> $%04X  delta=%+d\n",
+				unsigned(a), unsigned(b), d);
+	}
+
+	// (8) PC histogram (if enabled).
+	emit_pc_hist();
+
+	std::fprintf(stderr, "========== end post-mortem ==========\n\n");
 }
 
 
@@ -1917,6 +2115,39 @@ void picothing_state::machine_start()
 		}
 	}
 
+	// Stage F: --shadow and --pc-hist allocation.
+	if (std::getenv("PICOTHING_SHADOW"))
+	{
+		m_shadow_enabled = true;
+		m_shadow = std::make_unique<shadow_entry[]>(DAT_PHYS_SIZE);
+		std::memset(m_shadow.get(), 0, sizeof(shadow_entry) * DAT_PHYS_SIZE);
+		// Shadow tracking needs the dat_w hook even if no other taps
+		// are active.
+		m_have_physical_taps = true;
+		logerror("picothing: --shadow enabled (%u MB)\n",
+			unsigned((sizeof(shadow_entry) * DAT_PHYS_SIZE) >> 20));
+	}
+	if (const char *pch = std::getenv("PICOTHING_PCHIST"))
+	{
+		m_pc_hist_enabled = true;
+		m_pc_hist = std::make_unique<u32[]>(0x10000);
+		std::memset(m_pc_hist.get(), 0, sizeof(u32) * 0x10000);
+		long const n = std::strtol(pch, nullptr, 0);
+		if (n > 0) m_pc_hist_top_n = unsigned(n);
+		if (const char *fr = std::getenv("PICOTHING_PCHIST_FROM"))
+		{
+			char *e = nullptr;
+			unsigned long long const v = std::strtoull(fr, &e, 0);
+			if (e != fr) m_pc_hist_from = u64(v);
+		}
+		// --pc-hist also requires the on_instruction hook.
+		if (!m_trace_user_enabled && !m_brk_gated_enabled
+			&& m_brks.empty() && !m_trace_procs && !m_any_detector)
+		{
+			install_trace_opcode_tap_for_detectors();
+		}
+	}
+
 	// At exit, run all --dump regions and emit the cycle count.
 	machine().add_notifier(MACHINE_NOTIFY_EXIT,
 		machine_notify_delegate(&picothing_state::machine_exit_notify, this));
@@ -1926,6 +2157,9 @@ void picothing_state::machine_exit_notify()
 {
 	instrumentation_dump_all("exit");
 	instrumentation_emit_cycles();
+	// PC histogram is interesting on every clean exit, not just
+	// crashes — it answers "where did this run spend its time?".
+	emit_pc_hist();
 }
 
 void picothing_state::machine_reset()
