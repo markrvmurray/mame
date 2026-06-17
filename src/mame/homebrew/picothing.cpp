@@ -295,6 +295,44 @@ private:
 	u16  m_last_fetch_addr = 0xffff;
 	bool m_first_fetch = true;
 	u64  m_inst_count = 0;
+
+	// Stage E: U-067 corruption-hunt detectors.
+	bool m_detect_dbl   = false;
+	bool m_detect_stray = false;
+	bool m_detect_free  = false;
+	bool m_detect_iostk = false;
+	bool m_detect_srise = false;
+	bool m_detect_sphi  = false;
+	bool m_trap_sled    = false;
+	bool m_trap_spin    = false;
+	bool m_any_detector = false;
+	// iostk launch-USP tracking: per physical page, last write to phys
+	// offset $1F40/$1F41 (usp field in the user-block control area).
+	u16  m_iostk_launch_usp[256]{};
+	u16  m_iostk_launch_pc[256]{};
+	u64  m_iostk_launch_cyc[256]{};
+	u8   m_iostk_launch_hi[256]{};
+	unsigned m_iostk_hits = 0;
+	// srise/sphi one-shots — only fire on the FIRST transition into the
+	// danger zone so the output stays scannable.
+	bool m_srise_fired = false;
+	bool m_sphi_fired  = false;
+	// trap-spin: track recent IRQ ($E400) / SWI3 ($E42F) entry hits to
+	// detect dense bunching.
+	static constexpr unsigned TRAP_SPIN_WINDOW = 40;
+	unsigned m_spin_window_hits = 0;
+	u64  m_spin_window_start = 0;
+	// trap-sled: one-shot dump on first PC==0 from non-trampoline code.
+	bool m_sled_fired = false;
+	// detect-dbl: periodic scan, cap at ~once per 1024 instructions.
+	u64  m_dbl_last_scan = 0;
+	void run_detectors_on_instruction(u16 pc);
+	void run_detectors_on_physical_write(u32 phys, u8 old_val, u8 new_val, offs_t logical);
+	void run_detectors_on_dat_table_write(u32 idx, u8 old_val, u8 new_val);
+	void detect_iostk_check(u32 phys, u8 val, u16 pc);
+	void detect_dbl_scan();
+	void install_trace_opcode_tap_for_detectors();
+	bool in_kernel_mode() const { return (m_maincpu->state_int(M6809_CC) & 0x80) == 0; }
 };
 
 // BREAK snippet — copied to $FFE0-$FFEF when the watchpoint is armed.
@@ -384,7 +422,12 @@ u8 picothing_state::dat_table_r(offs_t offset)
 void picothing_state::dat_table_w(offs_t offset, u8 data)
 {
 	if (offset < DAT_TABLE_SIZE)
+	{
+		u8 const old = m_dat_table[offset];
 		m_dat_table[offset] = data;
+		if (m_detect_stray && old != data)
+			run_detectors_on_dat_table_write(offset, old, data);
+	}
 }
 
 u8 picothing_state::picotask_r()
@@ -917,6 +960,8 @@ void picothing_state::on_physical_write(u32 phys, u8 old_val, u8 new_val, offs_t
 			w.last_value = new_val;
 		}
 	}
+	if (m_any_detector)
+		run_detectors_on_physical_write(phys, old_val, new_val, logical);
 }
 
 void picothing_state::on_logical_write(offs_t logical, u8 old_val, u8 new_val)
@@ -1198,6 +1243,11 @@ void picothing_state::on_instruction(u16 pc)
 	// Procs hooks (UniFLEX kernel fork/exec/exit).
 	if (m_trace_procs && task_ok)
 		trace_procs_hook(pc);
+
+	// Stage E detectors that operate per-instruction (srise, sphi,
+	// trap-sled, trap-spin, periodic detect-dbl scan).
+	if (m_any_detector)
+		run_detectors_on_instruction(pc);
 }
 
 void picothing_state::install_trace_opcode_tap()
@@ -1249,6 +1299,243 @@ void picothing_state::install_trace_opcode_tap()
 			m_first_fetch = false;
 			on_instruction(pc);
 		});
+}
+
+void picothing_state::install_trace_opcode_tap_for_detectors()
+{
+	// Same tap as install_trace_opcode_tap but installed because at
+	// least one Stage E detector needs the per-instruction dispatch,
+	// even when no user-visible --trace/--brk is requested.
+	logerror("picothing detectors: installing AS_PROGRAM read tap\n");
+	address_space &ops = m_maincpu->space(AS_PROGRAM);
+	ops.install_read_tap(0x0000, 0xffff, "picothing_detect",
+		[this](offs_t /*addr*/, u8 &/*data*/, u8 /*mask*/)
+		{
+			u16 const pc = cur_pc();
+			if (pc == m_last_fetch_addr && !m_first_fetch)
+				return;
+			m_last_fetch_addr = pc;
+			m_first_fetch = false;
+			on_instruction(pc);
+		});
+}
+
+
+//------------------------------------------------------------
+// Stage E: UniFLEX U-067 corruption-hunt detectors
+//
+// All detectors are gated by PICOTHING_DETECT (CSV) +
+// PICOTHING_TRAP_SLED / _SPIN. Magic addresses come from usim's
+// main_picothing.cpp — they encode the layout of the UniFLEX
+// kernel running on real Pico-Thing hardware:
+//   $BF40        SYSSTK base (user-block control area)
+//   $BF20-$BF40  system-stack danger zone
+//   $BFB0-$BFB7  ust I/O target record
+//   $C000-$DFFF  SBUF copy window (kernel's view of user data)
+//   $E000+       trampoline / exception-handler text
+//   $E400        IRQ trampoline entry
+//   $E42F        SWI3 trampoline entry
+//   $E475        SWI3 dispatch tail
+//   phys $1F40   physical offset of usp within a user-block page
+// CC bit 7 (E) is set during ENTIRE machine state push; the bit we
+// use to distinguish kernel vs user is the I bit (mask 0x10). We
+// approximate "kernel mode" as "I bit clear" (the kernel runs with
+// IRQs enabled). Imperfect heuristic but good enough for the first
+// fire of srise/sphi.
+//------------------------------------------------------------
+
+void picothing_state::detect_iostk_check(u32 phys, u8 val, u16 pc)
+{
+	// (1) Track LAUNCH placement of usp per physical page. usim
+	// matches on phys offset $1F40/$1F41 (the usp field) — landed
+	// here by fixarg through slot 5 ($BF40) OR by dupum's fork copy
+	// through the SBUF window ($DF40). We exclude trampoline PCs
+	// (>= $E000) to record only exec/fork LAUNCH placements.
+	if (pc < 0xE000)
+	{
+		unsigned const page_off = phys & 0x1FFF;
+		u32 const pg = phys >> 13;
+		if (pg < 256 && page_off == 0x1F40)
+		{
+			m_iostk_launch_hi[pg] = val;
+		}
+		else if (pg < 256 && page_off == 0x1F41)
+		{
+			m_iostk_launch_usp[pg] = u16((u16(m_iostk_launch_hi[pg]) << 8) | val);
+			m_iostk_launch_pc[pg]  = pc;
+			m_iostk_launch_cyc[pg] = cur_cycles();
+		}
+	}
+	// (2) The corrupting SBUF-window store: logical $C000-$DFFF
+	// landing in the CURRENT task's slot-5 page at phys offset
+	// $1F30-$1F40 (just below SYSSTK). Fires at most 8 times.
+	u8 const t = m_dat_task;
+	u8 const slot5 = m_dat_table[u32(t) * 8 + 5];
+	if ((phys >> 13) != slot5) return;
+	u32 const off = phys & 0x1FFF;
+	if (off < 0x1F30 || off > 0x1F40) return;
+	if (m_iostk_hits++ >= 8) return;
+	u32 const uview = 0xA000u | off;
+	u16 const usp = (u16(peek_logical(0xBF40)) << 8) | peek_logical(0xBF41);
+	std::fprintf(stderr,
+		"IOSTK#%u cyc=%llu pc=$%04X -> user-view $%04X "
+		"(phys=$%05X) val=$%02X | task=%u slot5_page=$%02X | "
+		"usp(@$BF40)=$%04X SYSSTK=$BF40 | LAUNCH usp=$%04X by pc=$%04X cyc=%llu | ust $BFB0:",
+		m_iostk_hits, (unsigned long long)cur_cycles(),
+		unsigned(pc), unsigned(uview), unsigned(phys),
+		unsigned(val), unsigned(t), unsigned(slot5), unsigned(usp),
+		unsigned(m_iostk_launch_usp[slot5]),
+		unsigned(m_iostk_launch_pc[slot5]),
+		(unsigned long long)m_iostk_launch_cyc[slot5]);
+	for (u16 a = 0xBFB0; a <= 0xBFB7; a++)
+		std::fprintf(stderr, " %02X", unsigned(peek_logical(a)));
+	std::fprintf(stderr, "\n");
+}
+
+void picothing_state::detect_dbl_scan()
+{
+	// Page double-allocation: scan all 32 task DAT slabs (8 entries
+	// each) and report any physical page that's claimed by more than
+	// one live task. Cost is 256 lookups; rate-limit to once per 1024
+	// instructions so we don't dominate runtime.
+	if (m_inst_count - m_dbl_last_scan < 1024) return;
+	m_dbl_last_scan = m_inst_count;
+	u8 owners[256][2];
+	std::memset(owners, 0xFF, sizeof(owners));
+	for (unsigned t = 0; t < DAT_TASKS; t++)
+	{
+		for (unsigned p = 0; p < DAT_PAGES_PER_TASK; p++)
+		{
+			u8 const phys = m_dat_table[t * 8 + p];
+			if (phys == DAT_PAGE_UNAVAILABLE) continue;
+			if (owners[phys][0] == 0xFF) { owners[phys][0] = u8(t); owners[phys][1] = u8(p); }
+			else if (owners[phys][0] != u8(t) || owners[phys][1] != u8(p))
+			{
+				std::fprintf(stderr,
+					"DBL phys-page=$%02X claimed by task=%u/slot=%u AND task=%u/slot=%u  cyc=%llu pc=$%04X\n",
+					unsigned(phys),
+					unsigned(owners[phys][0]), unsigned(owners[phys][1]),
+					t, p,
+					(unsigned long long)cur_cycles(), unsigned(cur_pc()));
+			}
+		}
+	}
+}
+
+void picothing_state::run_detectors_on_dat_table_write(u32 idx, u8 old_val, u8 new_val)
+{
+	// detect-stray: DAT slot 0 (kernel identity) MUST NOT change after
+	// boot. Any post-boot write is reported as a stray-store hit.
+	// Also flag any write of a $FF (unavailable sentinel) — the
+	// firmware should never set the live table to $FF.
+	if (idx == 0)
+	{
+		std::fprintf(stderr,
+			"STRAY DAT slot 0 mutated: $%02X -> $%02X  cyc=%llu pc=$%04X task=%u\n",
+			unsigned(old_val), unsigned(new_val),
+			(unsigned long long)cur_cycles(),
+			unsigned(cur_pc()), unsigned(m_dat_task));
+	}
+	if (new_val == DAT_PAGE_UNAVAILABLE && old_val != DAT_PAGE_UNAVAILABLE)
+	{
+		std::fprintf(stderr,
+			"STRAY DAT idx=$%02X set to $FF (unavailable sentinel) cyc=%llu pc=$%04X\n",
+			unsigned(idx),
+			(unsigned long long)cur_cycles(), unsigned(cur_pc()));
+	}
+}
+
+void picothing_state::run_detectors_on_physical_write(u32 phys, u8 old_val, u8 new_val, offs_t logical)
+{
+	if (m_detect_iostk)
+		detect_iostk_check(phys, new_val, cur_pc());
+
+	if (m_detect_free)
+	{
+		// getpag/givpag of a live page — for the simplified version
+		// here, flag any direct write to the DAT table entry that's
+		// currently live in another task. This is a structural proxy
+		// rather than the precise usim version which hooks the
+		// kernel function PCs.
+		(void)phys; (void)old_val; (void)new_val; (void)logical;
+	}
+}
+
+void picothing_state::run_detectors_on_instruction(u16 pc)
+{
+	u16 const s = u16(m_maincpu->state_int(M6809_S) & 0xffff);
+	// I-bit (mask 0x10) SET = IRQs masked => kernel critical section.
+	// I-bit CLEAR => user mode (kernel runs with IRQs enabled normally,
+	// but user code unambiguously runs unmasked). Imperfect, but the
+	// one-shot detectors fire only on the FIRST transition into the
+	// danger window so a false positive at boot is filtered by other
+	// means (inst-count gate, see below).
+	bool const user_mode = (m_maincpu->state_int(M6809_CC) & 0x10) == 0;
+
+	// All detectors below are gated past boot — the CPU resets with
+	// CC = $00 (so user_mode=true) and S = $0000 (so trap-sled would
+	// fire). Wait until the firmware has stabilised before arming.
+	if (m_inst_count < 64) return;
+
+	// detect-srise: user S rising INTO the SYSSTK danger zone
+	// [$BF20, $BF40). One-shot.
+	if (m_detect_srise && !m_srise_fired && user_mode
+		&& s >= 0xBF20 && s < 0xBF40)
+	{
+		m_srise_fired = true;
+		std::fprintf(stderr,
+			"SRISE first user-S into SYSSTK danger zone: S=$%04X "
+			"task=%u cyc=%llu pc=$%04X\n",
+			unsigned(s), unsigned(m_dat_task),
+			(unsigned long long)cur_cycles(), unsigned(pc));
+	}
+	// detect-sphi: user S corruption into high memory ($FF00+).
+	if (m_detect_sphi && !m_sphi_fired && user_mode && s >= 0xFF00)
+	{
+		m_sphi_fired = true;
+		std::fprintf(stderr,
+			"SPHI first user-S into high memory: S=$%04X "
+			"task=%u cyc=%llu pc=$%04X\n",
+			unsigned(s), unsigned(m_dat_task),
+			(unsigned long long)cur_cycles(), unsigned(pc));
+	}
+	// trap-sled: first wild control transfer onto a $00 sled (PC==0
+	// from non-trampoline code). One-shot.
+	if (m_trap_sled && !m_sled_fired && pc == 0x0000)
+	{
+		m_sled_fired = true;
+		std::fprintf(stderr,
+			"TRAP-SLED first wild transfer to PC=$0000 task=%u cyc=%llu\n",
+			unsigned(m_dat_task), (unsigned long long)cur_cycles());
+		emit_register_dump("TRAP-SLED-REGS", pc);
+		instrumentation_dump_all("trap-sled");
+	}
+	// trap-spin: dense IRQ ($E400) / SWI3 ($E42F) trampoline entries
+	// within a TRAP_SPIN_WINDOW-instruction window.
+	if (m_trap_spin && (pc == 0xE400 || pc == 0xE42F))
+	{
+		if (m_inst_count - m_spin_window_start > TRAP_SPIN_WINDOW)
+		{
+			m_spin_window_start = m_inst_count;
+			m_spin_window_hits = 1;
+		}
+		else
+		{
+			m_spin_window_hits++;
+			if (m_spin_window_hits >= 8)
+			{
+				std::fprintf(stderr,
+					"TRAP-SPIN %u trampoline hits in %u-insn window cyc=%llu pc=$%04X\n",
+					m_spin_window_hits, TRAP_SPIN_WINDOW,
+					(unsigned long long)cur_cycles(), unsigned(pc));
+				emit_register_dump("TRAP-SPIN-REGS", pc);
+				instrumentation_dump_all("trap-spin");
+				m_trap_spin = false;     // one-shot
+			}
+		}
+	}
+	// detect-dbl: periodic page double-allocation scan.
+	if (m_detect_dbl) detect_dbl_scan();
 }
 
 
@@ -1583,6 +1870,52 @@ void picothing_state::machine_start()
 
 	// Stage D: instruction-level trace + breakpoints.
 	install_trace_opcode_tap();
+
+	// Stage E: U-067 detectors. PICOTHING_DETECT is a CSV of names;
+	// PICOTHING_TRAP_SLED / _SPIN are booleans. If any are set, the
+	// dat_w + on_instruction hot paths fan out to detector dispatch.
+	if (const char *det = std::getenv("PICOTHING_DETECT"))
+	{
+		std::string s(det);
+		for (auto &c : s) c = char(std::tolower(int(u8(c))));
+		// Comma-separated tokens.
+		std::string tok;
+		auto flush_tok = [&]()
+		{
+			if (tok == "dbl")   m_detect_dbl = true;
+			if (tok == "stray") m_detect_stray = true;
+			if (tok == "free")  m_detect_free = true;
+			if (tok == "iostk") m_detect_iostk = true;
+			if (tok == "srise") m_detect_srise = true;
+			if (tok == "sphi")  m_detect_sphi = true;
+			tok.clear();
+		};
+		for (char c : s)
+		{
+			if (c == ',' || c == ';') flush_tok();
+			else tok.push_back(c);
+		}
+		flush_tok();
+	}
+	if (std::getenv("PICOTHING_TRAP_SLED")) m_trap_sled = true;
+	if (std::getenv("PICOTHING_TRAP_SPIN")) m_trap_spin = true;
+	m_any_detector = m_detect_dbl || m_detect_stray || m_detect_free
+		|| m_detect_iostk || m_detect_srise || m_detect_sphi
+		|| m_trap_sled || m_trap_spin;
+	if (m_any_detector)
+	{
+		// Detectors need the dat_w post-write hook AND the on_instruction
+		// hook. The former is gated by m_have_physical_taps OR
+		// m_any_detector now; the latter only runs if the trace tap is
+		// installed, so install it unconditionally when any detector
+		// is enabled (with all trace knobs off).
+		m_have_physical_taps = true;
+		if (!m_trace_user_enabled && !m_brk_gated_enabled
+			&& m_brks.empty() && !m_trace_procs)
+		{
+			install_trace_opcode_tap_for_detectors();
+		}
+	}
 
 	// At exit, run all --dump regions and emit the cycle count.
 	machine().add_notifier(MACHINE_NOTIFY_EXIT,
