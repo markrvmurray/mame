@@ -63,6 +63,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "bus/generic/carts.h"
 #include "bus/generic/slot.h"
@@ -176,6 +178,27 @@ private:
 	// TraceCtl
 	void tracectl_w(u8 data);
 
+	// Stage C: non-perturbing instrumentation.
+	struct addr_spec {
+		bool physical;
+		u32  base;
+		u32  len;       // for watch: 1; for wlog/dump: user-specified
+		u8   last_value;
+	};
+	static bool parse_addr_spec(const std::string &s, addr_spec &out, u32 default_len);
+	static std::vector<std::string> split_specs(const char *env, char sep);
+	u8   peek_logical(u16 addr) const;
+	u8   peek_physical(u32 phys) const;
+	void on_physical_write(u32 phys, u8 old_val, u8 new_val, offs_t logical);
+	void on_logical_write(offs_t logical, u8 old_val, u8 new_val);
+	void install_instrumentation_taps();
+	void instrumentation_dump_all(const char *trigger);
+	void instrumentation_dump_one(const addr_spec &spec);
+	void instrumentation_emit_cycles();
+	u64  cur_cycles() const { return m_maincpu->total_cycles(); }
+	u16  cur_pc() const { return u16(m_maincpu->state_int(M6809_PC) & 0xffff); }
+	void machine_exit_notify();
+
 	// Firmware loading
 	std::pair<std::error_condition, std::string> load_cart(device_image_interface &image);
 	bool parse_intel_hex(const u8 *src, u32 size, u8 *out64k);
@@ -234,6 +257,13 @@ private:
 
 	// TraceCtl state
 	bool m_trace_enabled = false;
+
+	// Stage C: non-perturbing instrumentation state.
+	std::vector<addr_spec> m_watches;
+	std::vector<addr_spec> m_wlogs;
+	std::vector<addr_spec> m_dumps;
+	std::string m_cycles_file_path;
+	bool m_have_physical_taps = false;   // any p: spec in watches or wlogs?
 };
 
 // BREAK snippet — copied to $FFE0-$FFEF when the watchpoint is armed.
@@ -293,7 +323,11 @@ void picothing_state::dat_w(offs_t offset, u8 data)
 {
 	if (offset >= DAT_FIXED_WINDOW_BASE)
 	{
-		m_dat_phys[DAT_FIXED_PHYS_BASE + (offset - DAT_FIXED_WINDOW_BASE)] = data;
+		u32 const phys = DAT_FIXED_PHYS_BASE + (offset - DAT_FIXED_WINDOW_BASE);
+		u8 const old = m_dat_phys[phys];
+		m_dat_phys[phys] = data;
+		if (m_have_physical_taps && (old != data || !m_watches.empty() || !m_wlogs.empty()))
+			on_physical_write(phys, old, data, offset);
 		return;
 	}
 
@@ -305,7 +339,10 @@ void picothing_state::dat_w(offs_t offset, u8 data)
 		return;     // store is dropped
 	}
 	u32 const phys = (u32(phys_page) << 13) | (offset & 0x1FFF);
+	u8 const old = m_dat_phys[phys];
 	m_dat_phys[phys] = data;
+	if (m_have_physical_taps && (old != data || !m_watches.empty() || !m_wlogs.empty()))
+		on_physical_write(phys, old, data, offset);
 }
 
 u8 picothing_state::dat_table_r(offs_t offset)
@@ -724,6 +761,265 @@ void picothing_state::tracectl_w(u8 data)
 
 
 //------------------------------------------------------------
+// Stage C: non-perturbing instrumentation
+//
+// --watch=[p:]ADDR        monitor a byte for changes (repeatable)
+// --wlog=[p:]ADDR[,LEN]   log every store into range (repeatable)
+// --dump=[p:]ADDR[,LEN]   hex+ASCII dump at exit (default LEN=256)
+// --cycles                emit cycles=<N> to sidecar file at exit
+//
+// Specs come in via PICOTHING_WATCH / _WLOG / _DUMP (semicolon-
+// separated lists set by the headless wrapper). Logical-address
+// (default) writes are caught via address_space::install_write_tap
+// on $0000-$FDFF; physical-address (p:) writes flow through the
+// dat_w post-write hook. Either path uses peek_logical/peek_physical
+// to read the old value without perturbing device state.
+//------------------------------------------------------------
+
+std::vector<std::string> picothing_state::split_specs(const char *env, char sep)
+{
+	std::vector<std::string> out;
+	if (!env || !*env) return out;
+	std::string cur;
+	for (const char *p = env; *p; p++)
+	{
+		if (*p == sep)
+		{
+			if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+		}
+		else cur.push_back(*p);
+	}
+	if (!cur.empty()) out.push_back(cur);
+	return out;
+}
+
+bool picothing_state::parse_addr_spec(const std::string &s, addr_spec &out, u32 default_len)
+{
+	if (s.empty()) return false;
+	std::string body = s;
+	out.physical = false;
+	if (body.size() > 2 && body[0] == 'p' && body[1] == ':')
+	{
+		out.physical = true;
+		body = body.substr(2);
+	}
+	// Split on first ','.
+	std::string addr_part = body, len_part;
+	auto const comma = body.find(',');
+	if (comma != std::string::npos)
+	{
+		addr_part = body.substr(0, comma);
+		len_part  = body.substr(comma + 1);
+	}
+	// Parse hex or decimal — strtoul handles "0x.." and "0...".
+	char *end = nullptr;
+	unsigned long const a = std::strtoul(addr_part.c_str(), &end, 0);
+	if (end == addr_part.c_str()) return false;
+	out.base = u32(a);
+	out.len = default_len;
+	if (!len_part.empty())
+	{
+		unsigned long const n = std::strtoul(len_part.c_str(), &end, 0);
+		if (end == len_part.c_str() || n == 0) return false;
+		out.len = u32(n);
+	}
+	// Sanity bound: logical addrs in 64K, physical in 2 MB.
+	u32 const max_addr = out.physical ? DAT_PHYS_SIZE : 0x10000;
+	if (out.base >= max_addr) return false;
+	if (out.base + out.len > max_addr) out.len = max_addr - out.base;
+	out.last_value = 0;
+	return true;
+}
+
+u8 picothing_state::peek_logical(u16 addr) const
+{
+	// Non-perturbing logical read — bypasses ACIA/IDE/tick/watchpoint
+	// side effects. Used by instrumentation only.
+	if (addr >= 0xFE00 && addr < 0xFF00)
+		return m_dat_table[addr - 0xFE00];
+	if (addr >= DAT_FIXED_WINDOW_BASE && addr < 0xFE00)
+		return m_dat_phys[DAT_FIXED_PHYS_BASE + (addr - DAT_FIXED_WINDOW_BASE)];
+	if (addr < DAT_FIXED_WINDOW_BASE)
+	{
+		u8 const page_idx = (m_dat_task << 3) | (addr >> 13);
+		u8 const pp = m_dat_table[page_idx];
+		if (pp == DAT_PAGE_UNAVAILABLE) return 0xff;
+		return m_dat_phys[(u32(pp) << 13) | (addr & 0x1fff)];
+	}
+	// IO zone $FF00+ has device-specific semantics; return 0xff so
+	// peek-into-IO never disturbs device state.
+	return 0xff;
+}
+
+u8 picothing_state::peek_physical(u32 phys) const
+{
+	return (phys < DAT_PHYS_SIZE) ? m_dat_phys[phys] : 0xff;
+}
+
+void picothing_state::on_physical_write(u32 phys, u8 old_val, u8 new_val, offs_t logical)
+{
+	for (auto const &w : m_wlogs)
+	{
+		if (w.physical && phys >= w.base && phys < w.base + w.len)
+		{
+			std::fprintf(stderr,
+				"WLOG[p] cycle=%llu pc=$%04X phys=$%06X (virt=$%04X) old=$%02X new=$%02X\n",
+				(unsigned long long)cur_cycles(), unsigned(cur_pc()),
+				unsigned(phys), unsigned(logical), unsigned(old_val), unsigned(new_val));
+		}
+	}
+	for (auto &w : m_watches)
+	{
+		if (w.physical && phys == w.base && old_val != new_val)
+		{
+			std::fprintf(stderr,
+				"WATCH[p] cycle=%llu pc=$%04X phys=$%06X (virt=$%04X) old=$%02X new=$%02X\n",
+				(unsigned long long)cur_cycles(), unsigned(cur_pc()),
+				unsigned(phys), unsigned(logical), unsigned(old_val), unsigned(new_val));
+			w.last_value = new_val;
+		}
+	}
+}
+
+void picothing_state::on_logical_write(offs_t logical, u8 old_val, u8 new_val)
+{
+	for (auto const &w : m_wlogs)
+	{
+		if (!w.physical && u32(logical) >= w.base && u32(logical) < w.base + w.len)
+		{
+			std::fprintf(stderr,
+				"WLOG cycle=%llu pc=$%04X virt=$%04X old=$%02X new=$%02X\n",
+				(unsigned long long)cur_cycles(), unsigned(cur_pc()),
+				unsigned(logical), unsigned(old_val), unsigned(new_val));
+		}
+	}
+	for (auto &w : m_watches)
+	{
+		if (!w.physical && u32(logical) == w.base && old_val != new_val)
+		{
+			std::fprintf(stderr,
+				"WATCH cycle=%llu pc=$%04X virt=$%04X old=$%02X new=$%02X\n",
+				(unsigned long long)cur_cycles(), unsigned(cur_pc()),
+				unsigned(logical), unsigned(old_val), unsigned(new_val));
+			w.last_value = new_val;
+		}
+	}
+}
+
+void picothing_state::install_instrumentation_taps()
+{
+	// Parse PICOTHING_WATCH / _WLOG / _DUMP into m_watches / m_wlogs /
+	// m_dumps. Failures are logged but non-fatal (rest of the list
+	// still gets installed).
+	auto parse_list = [this](const char *env_name, std::vector<addr_spec> &dst, u32 default_len)
+	{
+		const char *env = std::getenv(env_name);
+		if (!env || !*env) return;
+		for (auto const &s : split_specs(env, ';'))
+		{
+			addr_spec spec;
+			if (parse_addr_spec(s, spec, default_len))
+			{
+				spec.last_value = spec.physical
+					? peek_physical(spec.base) : peek_logical(u16(spec.base));
+				dst.push_back(spec);
+			}
+			else
+			{
+				logerror("picothing: %s: invalid spec '%s'\n", env_name, s.c_str());
+			}
+		}
+	};
+
+	parse_list("PICOTHING_WATCH", m_watches, 1);
+	parse_list("PICOTHING_WLOG",  m_wlogs,   1);
+	parse_list("PICOTHING_DUMP",  m_dumps,   256);
+
+	// Any physical specs? Toggle the dat_w hot path's fast-skip flag.
+	for (auto const &w : m_watches) if (w.physical) { m_have_physical_taps = true; break; }
+	if (!m_have_physical_taps)
+		for (auto const &w : m_wlogs) if (w.physical) { m_have_physical_taps = true; break; }
+
+	// Install per-spec write taps for LOGICAL specs. Taps capture old
+	// value via peek_logical (non-perturbing) and call into our
+	// unified on_logical_write dispatcher.
+	address_space &space = m_maincpu->space(AS_PROGRAM);
+	auto install_one = [this, &space](const addr_spec &spec, const char *kind)
+	{
+		if (spec.physical) return;
+		offs_t const lo = offs_t(spec.base);
+		offs_t const hi = offs_t(spec.base + spec.len - 1);
+		std::string name = std::string("picothing_") + kind;
+		space.install_write_tap(lo, hi, name,
+			[this](offs_t addr, u8 &data, u8 /*mask*/)
+			{
+				u8 const old = peek_logical(u16(addr));
+				on_logical_write(addr, old, data);
+			});
+	};
+	for (auto const &w : m_watches) install_one(w, "watch");
+	for (auto const &w : m_wlogs)   install_one(w, "wlog");
+
+	// --cycles sidecar path (mirrors LLVM6309_CYCLES_FILE convention).
+	if (const char *cf = std::getenv("PICOTHING_CYCLES_FILE"))
+		m_cycles_file_path = cf;
+}
+
+void picothing_state::instrumentation_dump_one(const addr_spec &spec)
+{
+	std::fprintf(stderr, "DUMP %s$%0*X len=%u  cycle=%llu pc=$%04X\n",
+		spec.physical ? "phys " : "virt ",
+		spec.physical ? 6 : 4, unsigned(spec.base), unsigned(spec.len),
+		(unsigned long long)cur_cycles(), unsigned(cur_pc()));
+	for (u32 row = 0; row < spec.len; row += 16)
+	{
+		std::fprintf(stderr, "  %0*X  ",
+			spec.physical ? 6 : 4, unsigned(spec.base + row));
+		// Hex.
+		for (u32 i = 0; i < 16; i++)
+		{
+			if (row + i < spec.len)
+			{
+				u8 const v = spec.physical
+					? peek_physical(spec.base + row + i)
+					: peek_logical(u16(spec.base + row + i));
+				std::fprintf(stderr, "%02X ", unsigned(v));
+			}
+			else std::fprintf(stderr, "   ");
+		}
+		// ASCII.
+		std::fprintf(stderr, " |");
+		for (u32 i = 0; i < 16 && row + i < spec.len; i++)
+		{
+			u8 const v = spec.physical
+				? peek_physical(spec.base + row + i)
+				: peek_logical(u16(spec.base + row + i));
+			std::fputc((v >= 0x20 && v < 0x7f) ? char(v) : '.', stderr);
+		}
+		std::fprintf(stderr, "|\n");
+	}
+}
+
+void picothing_state::instrumentation_dump_all(const char *trigger)
+{
+	if (m_dumps.empty()) return;
+	std::fprintf(stderr, "--- picothing dump (%s) ---\n", trigger);
+	for (auto const &spec : m_dumps)
+		instrumentation_dump_one(spec);
+}
+
+void picothing_state::instrumentation_emit_cycles()
+{
+	if (m_cycles_file_path.empty()) return;
+	if (FILE *fp = std::fopen(m_cycles_file_path.c_str(), "w"))
+	{
+		std::fprintf(fp, "%llu\n", (unsigned long long)cur_cycles());
+		std::fclose(fp);
+	}
+}
+
+
+//------------------------------------------------------------
 // Firmware loading — raw / Intel HEX / S-record / ELF
 //------------------------------------------------------------
 
@@ -1046,6 +1342,21 @@ void picothing_state::machine_start()
 	save_item(NAME(m_swp_saved_nmi_hi));
 	save_item(NAME(m_swp_saved_nmi_lo));
 	save_item(NAME(m_trace_enabled));
+
+	// Stage C: parse PICOTHING_WATCH / _WLOG / _DUMP / _CYCLES_FILE
+	// and install non-perturbing memory taps. Must come AFTER cart
+	// distribution so peek_logical reads the post-load values.
+	install_instrumentation_taps();
+
+	// At exit, run all --dump regions and emit the cycle count.
+	machine().add_notifier(MACHINE_NOTIFY_EXIT,
+		machine_notify_delegate(&picothing_state::machine_exit_notify, this));
+}
+
+void picothing_state::machine_exit_notify()
+{
+	instrumentation_dump_all("exit");
+	instrumentation_emit_cycles();
 }
 
 void picothing_state::machine_reset()
