@@ -4,30 +4,192 @@
 #
 # Headless wrapper for the picothing subtarget on macOS.
 #
+# Mirrors the usim09pt CLI surface so the same firmware + flags drive
+# both simulators. Flags are translated into PICOTHING_* env vars and
+# consumed by the driver at machine_start / runtime.
+#
 # Usage:
-#   ./mamepicothing-headless <firmware> [timeout-seconds]
-#   ./mamepicothing-headless --debug[=PORT] <firmware>
+#   ./mamepicothing-headless [FLAGS] <firmware> [timeout-seconds]
+#   ./mamepicothing-headless --debug[=PORT] [FLAGS] <firmware>
 #
-# Pico-Thing firmware has no host-exit mechanism, so timeout is the
-# normal termination — the wrapper always exits 124 (timeout) on a
-# clean run unless the gdbstub mode is used.
+# Pico-Thing firmware has no host-exit port, so on a clean run the
+# wrapper exits 124 (GNU timeout convention) unless --timeout fires
+# the in-driver instruction cap, in which case it also exits 124.
 #
-# Environment variables passed through to the driver:
-#   PICOTHING_DISK_FILE   path to the PATA IDE backing file
-#   PICOTHING_FRAM_FILE   path to the FRAM persistence file
-#                         (default: picothing.fram in cwd)
+# File-backed sidecars:
+#   -d <disk.img>         master IDE backing image
+#   -D <disk.img>         slave  IDE backing image
+#   -f <fram.dat>         FRAM persistence file (48 bytes; default
+#                         picothing.fram in cwd)
+#
+# Core simulation:
+#   --timeout=N           in-driver instruction-cycle cap; rc=124 if hit
+#   --cycles              emit "cycles=<N>" to stderr at exit
+#   --tick=N              cycles per PicoTick (default 20000 = 50 Hz)
+#   --aux-pty             back the aux ACIA with a host pseudo-terminal;
+#                         slave path printed to stderr at startup
+#
+# Trace / breakpoint:
+#   --trace                       per-instruction CPU trace to stderr
+#   --trace-from=N --trace-to=N   instruction-windowed trace
+#   --ctrace-from=M --ctrace-to=M cycle-windowed trace
+#   --brk=ADDR[,ADDR,...]         PC breakpoint(s) — register dump on hit
+#   --brk-gated                   start brk disabled; guest pokes $FFCB to
+#                                 toggle (0x00 off, 0x01 brk, 0x02 brk+trace)
+#   --trace-task=ADDR             gate trace/brk to one active task TCB
+#   --trace-procs                 hook UniFLEX kernel fork/exec/exit
+#
+# Non-perturbing instrumentation:
+#   --watch=[p:]ADDR              monitor a byte for changes (repeatable);
+#                                 p: prefix reads physical store (bypass DAT)
+#   --dump=[p:]ADDR[,LEN]         hex+ASCII dump on each brk hit and at exit
+#                                 (default LEN=256, repeatable)
+#   --wlog=[p:]ADDR[,LEN]         log every guest store into range
+#                                 (cycle+PC+old/new, repeatable)
+#   --shadow                      per-byte last-writer (PC+cycle) on the
+#                                 2 MB physical store (~12 MB overhead)
+#   --pc-hist[=N]                 instruction-PC histogram; top N clusters
+#                                 printed at exit (default N=24)
+#   --pc-hist-from=M              start sampling at instruction M (skip boot)
+#
+# UniFLEX U-067 corruption-hunt detectors (require knowledge of the
+# UniFLEX kernel layout — see usim's main_picothing.cpp for the magic
+# addresses; repeatable comma-separated):
+#   --detect-dbl                  page double-allocation
+#   --detect-stray                stray write into another task's frame
+#   --detect-free                 getpag/givpag of a live task's page
+#   --detect-iostk                SBUF-window store into stack-overlap zone
+#   --detect-srise                first user S into SYSSTK danger zone
+#   --detect-sphi                 first S corruption into high memory
+#   --trap-sled                   post-mortem at first $00-sled wild branch
+#   --trap-spin                   post-mortem at IRQ/SWI3 trampoline spin
+#
+# Deterministic console input:
+#   --input=STR                   feed STR into the console ACIA RX.
+#                                 Escapes: \r \n \t \0 \\
+#   --input-first=N               cycle at which the first byte is released
+#   --input-step=N                cycles between successive input bytes
+#
+# Debug attach (gdbstub) — incompatible with --timeout/--trace etc:
+#   --debug[=PORT]                start gdbstub on PORT (default 2159) and
+#                                 wait for client; no -seconds_to_run cap
 
 set -e
 
+# ---------- defaults ----------
 debug_mode=0
 debug_port=2159
-case "${1-}" in
-    --debug)        debug_mode=1; shift ;;
-    --debug=*)      debug_mode=1; debug_port=${1#--debug=}; shift ;;
-esac
+
+# Repeatable specs accumulate, separator ';'.
+watch_specs=
+dump_specs=
+wlog_specs=
+brk_specs=
+detect_csv=
+
+# Booleans / single-value flags.
+trace=
+trace_from=
+trace_to=
+ctrace_from=
+ctrace_to=
+brk_gated=
+trace_task=
+trace_procs=
+shadow=
+pchist=
+pchist_from=
+timeout_cap=
+tick=
+emit_cycles=
+aux_pty=
+trap_sled=
+trap_spin=
+input_str=
+input_first=
+input_step=
+
+# Sidecar files (already-supported env vars).
+disk_master=
+disk_slave=
+fram_file=
+
+# ---------- arg parsing ----------
+append_spec() {
+    # $1 = current accumulator, $2 = new spec → echoes new accumulator
+    if [ -z "$1" ]; then
+        printf '%s' "$2"
+    else
+        printf '%s;%s' "$1" "$2"
+    fi
+}
+
+append_csv() {
+    if [ -z "$1" ]; then
+        printf '%s' "$2"
+    else
+        printf '%s,%s' "$1" "$2"
+    fi
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --debug)              debug_mode=1 ;;
+        --debug=*)            debug_mode=1; debug_port=${1#--debug=} ;;
+
+        -d)                   shift; disk_master="$1" ;;
+        -d*)                  disk_master=${1#-d} ;;
+        -D)                   shift; disk_slave="$1" ;;
+        -D*)                  disk_slave=${1#-D} ;;
+        -f)                   shift; fram_file="$1" ;;
+        -f*)                  fram_file=${1#-f} ;;
+
+        --timeout=*)          timeout_cap=${1#--timeout=} ;;
+        --cycles)             emit_cycles=1 ;;
+        --tick=*)             tick=${1#--tick=} ;;
+        --aux-pty)            aux_pty=1 ;;
+
+        --trace)              trace=1 ;;
+        --trace-from=*)       trace_from=${1#--trace-from=} ;;
+        --trace-to=*)         trace_to=${1#--trace-to=} ;;
+        --ctrace-from=*)      ctrace_from=${1#--ctrace-from=} ;;
+        --ctrace-to=*)        ctrace_to=${1#--ctrace-to=} ;;
+        --brk=*)              brk_specs=$(append_spec "$brk_specs" "${1#--brk=}") ;;
+        --brk-gated)          brk_gated=1 ;;
+        --trace-task=*)       trace_task=${1#--trace-task=} ;;
+        --trace-procs)        trace_procs=1 ;;
+
+        --watch=*)            watch_specs=$(append_spec "$watch_specs" "${1#--watch=}") ;;
+        --dump=*)             dump_specs=$(append_spec "$dump_specs" "${1#--dump=}") ;;
+        --wlog=*)             wlog_specs=$(append_spec "$wlog_specs" "${1#--wlog=}") ;;
+        --shadow)             shadow=1 ;;
+        --pc-hist)            pchist=24 ;;
+        --pc-hist=*)          pchist=${1#--pc-hist=} ;;
+        --pc-hist-from=*)     pchist_from=${1#--pc-hist-from=} ;;
+
+        --detect-dbl)         detect_csv=$(append_csv "$detect_csv" "dbl") ;;
+        --detect-stray)       detect_csv=$(append_csv "$detect_csv" "stray") ;;
+        --detect-free)        detect_csv=$(append_csv "$detect_csv" "free") ;;
+        --detect-iostk)       detect_csv=$(append_csv "$detect_csv" "iostk") ;;
+        --detect-srise)       detect_csv=$(append_csv "$detect_csv" "srise") ;;
+        --detect-sphi)        detect_csv=$(append_csv "$detect_csv" "sphi") ;;
+        --trap-sled)          trap_sled=1 ;;
+        --trap-spin)          trap_spin=1 ;;
+
+        --input=*)            input_str=${1#--input=} ;;
+        --input-first=*)      input_first=${1#--input-first=} ;;
+        --input-step=*)       input_step=${1#--input-step=} ;;
+
+        --)                   shift; break ;;
+        --*)                  echo "mamepicothing-headless: unknown flag $1" >&2; exit 2 ;;
+        *)                    break ;;
+    esac
+    shift
+done
 
 if [ $# -lt 1 ]; then
-    echo "usage: mamepicothing-headless [--debug[=PORT]] <firmware> [timeout-seconds]" >&2
+    echo "usage: mamepicothing-headless [FLAGS] <firmware> [timeout-seconds]" >&2
+    echo "       mamepicothing-headless --help-flags  (list every flag)" >&2
     exit 1
 fi
 
@@ -35,33 +197,89 @@ rom="$1"
 timeout="${2:-5}"
 here=$(dirname "$0")
 
+# ---------- temp files ----------
 outfile=$(mktemp /tmp/picothing_out.XXXXXX)
-trap 'rm -f "$outfile"' EXIT
+cyclesfile=$(mktemp /tmp/picothing_cycles.XXXXXX)
+trap 'rm -f "$outfile" "$cyclesfile"' EXIT
 
+# ---------- env-var wiring ----------
+# Existing sidecars (kept identical to the pre-Stage-B contract).
+[ -n "$disk_master" ] && export PICOTHING_DISK_FILE="$disk_master"
+[ -n "$disk_slave"  ] && export PICOTHING_DISK_SLAVE="$disk_slave"
+[ -n "$fram_file"   ] && export PICOTHING_FRAM_FILE="$fram_file"
+
+# Core sim.
+[ -n "$timeout_cap" ] && export PICOTHING_TIMEOUT="$timeout_cap"
+[ -n "$tick"        ] && export PICOTHING_TICK="$tick"
+[ -n "$emit_cycles" ] && export PICOTHING_CYCLES_FILE="$cyclesfile"
+[ -n "$aux_pty"     ] && export PICOTHING_AUX_PTY=1
+
+# Trace / brk.
+[ -n "$trace"        ] && export PICOTHING_TRACE=1
+[ -n "$trace_from"   ] && export PICOTHING_TRACE_FROM="$trace_from"
+[ -n "$trace_to"     ] && export PICOTHING_TRACE_TO="$trace_to"
+[ -n "$ctrace_from"  ] && export PICOTHING_CTRACE_FROM="$ctrace_from"
+[ -n "$ctrace_to"    ] && export PICOTHING_CTRACE_TO="$ctrace_to"
+[ -n "$brk_specs"    ] && export PICOTHING_BRK="$brk_specs"
+[ -n "$brk_gated"    ] && export PICOTHING_BRK_GATED=1
+[ -n "$trace_task"   ] && export PICOTHING_TRACE_TASK="$trace_task"
+[ -n "$trace_procs"  ] && export PICOTHING_TRACE_PROCS=1
+
+# Non-perturbing instrumentation.
+[ -n "$watch_specs"  ] && export PICOTHING_WATCH="$watch_specs"
+[ -n "$dump_specs"   ] && export PICOTHING_DUMP="$dump_specs"
+[ -n "$wlog_specs"   ] && export PICOTHING_WLOG="$wlog_specs"
+[ -n "$shadow"       ] && export PICOTHING_SHADOW=1
+[ -n "$pchist"       ] && export PICOTHING_PCHIST="$pchist"
+[ -n "$pchist_from"  ] && export PICOTHING_PCHIST_FROM="$pchist_from"
+
+# Detectors.
+[ -n "$detect_csv"   ] && export PICOTHING_DETECT="$detect_csv"
+[ -n "$trap_sled"    ] && export PICOTHING_TRAP_SLED=1
+[ -n "$trap_spin"    ] && export PICOTHING_TRAP_SPIN=1
+
+# Deterministic input.
+[ -n "$input_str"    ] && export PICOTHING_INPUT="$input_str"
+[ -n "$input_first"  ] && export PICOTHING_INPUT_FIRST="$input_first"
+[ -n "$input_step"   ] && export PICOTHING_INPUT_STEP="$input_step"
+
+# Always set these so the driver can locate sidecar paths even if the
+# user passed bare paths via -d / -f.
+export SDL_VIDEO_DRIVER=dummy
+
+# ---------- launch ----------
 if [ "$debug_mode" -eq 1 ]; then
     echo "mamepicothing listening for gdb-RSP on localhost:${debug_port}" >&2
-    env SDL_VIDEO_DRIVER=dummy \
-        "${here}/mamepicothing" picothing \
-            -video none -sound none -window -nothrottle \
-            -keyboardprovider none -mouseprovider none \
-            -lightgunprovider none -joystickprovider none \
-            -midiprovider none \
-            -debugger gdbstub -debugger_host localhost -debugger_port "$debug_port" -debug \
-            -skip_gameinfo -noplugins -uifontprovider none \
-            -rom "$rom" \
-            -rs232 null_modem -bitb "$outfile"
-else
-    env SDL_VIDEO_DRIVER=dummy \
-        "${here}/mamepicothing" picothing \
-            -video none -sound none -window -nothrottle \
-            -keyboardprovider none -mouseprovider none \
-            -lightgunprovider none -joystickprovider none \
-            -midiprovider none -debugger none \
-            -skip_gameinfo -noplugins -uifontprovider none \
-            -rom "$rom" \
-            -rs232 null_modem -bitb "$outfile" \
-            -seconds_to_run "$timeout"
-    cat "$outfile"
+    echo "  attach with: lldb \"$rom\" -o 'gdb-remote localhost:${debug_port}'" >&2
+    "${here}/mamepicothing" picothing \
+        -video none -sound none -window -nothrottle \
+        -keyboardprovider none -mouseprovider none \
+        -lightgunprovider none -joystickprovider none \
+        -midiprovider none \
+        -debugger gdbstub -debugger_host localhost -debugger_port "$debug_port" -debug \
+        -skip_gameinfo -noplugins -uifontprovider none \
+        -rom "$rom" \
+        -rs232 null_modem -bitb "$outfile"
+    exit $?
 fi
 
+"${here}/mamepicothing" picothing \
+    -video none -sound none -window -nothrottle \
+    -keyboardprovider none -mouseprovider none \
+    -lightgunprovider none -joystickprovider none \
+    -midiprovider none -debugger none \
+    -skip_gameinfo -noplugins -uifontprovider none \
+    -rom "$rom" \
+    -rs232 null_modem -bitb "$outfile" \
+    -seconds_to_run "$timeout"
+
+cat "$outfile"
+
+# --cycles: emit "cycles=<N>" on stderr if the driver wrote one.
+if [ -n "$emit_cycles" ] && [ -s "$cyclesfile" ]; then
+    echo "cycles=$(cat "$cyclesfile")" >&2
+fi
+
+# Pico-Thing has no halt port; clean runs always exit 124 (timeout
+# convention) — matches usim09pt and the bench harness's expectation.
 exit 124
