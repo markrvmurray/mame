@@ -86,6 +86,11 @@ of devices it depends on. Link time is seconds, not minutes — there's no
 need to ever do the full `make` in this fork unless you're chasing an
 upstream regression.
 
+See [`BUILDING.md`](BUILDING.md) for the build mechanics in detail:
+how the subtarget `.lua` and `.lst` files scope the compile, what's
+unavoidably always built, and how to handle build breaks coming from
+upstream churn.
+
 ## What's not modified
 
 Everything outside `src/mame/homebrew/{llvm6309,picothing}*`, the two
