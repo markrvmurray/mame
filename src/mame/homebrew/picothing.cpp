@@ -178,6 +178,16 @@ private:
 	// TraceCtl
 	void tracectl_w(u8 data);
 
+	// Stage D: instruction-level trace + breakpoints.
+	// Tapped from AS_OPCODES — first opcode fetch of each instruction.
+	void on_instruction(u16 pc);
+	void install_trace_opcode_tap();
+	void emit_register_dump(const char *prefix, u16 pc);
+	bool task_filter_matches(u16 target_tcb) const;
+	void trace_procs_hook(u16 pc);
+	std::vector<u16> parse_addr_csv(const char *env) const;
+	static u64 parse_u64_env(const char *env, u64 dflt);
+
 	// Stage C: non-perturbing instrumentation.
 	struct addr_spec {
 		bool physical;
@@ -264,6 +274,27 @@ private:
 	std::vector<addr_spec> m_dumps;
 	std::string m_cycles_file_path;
 	bool m_have_physical_taps = false;   // any p: spec in watches or wlogs?
+
+	// Stage D: trace + breakpoint state.
+	bool m_trace_user_enabled = false;
+	u64  m_trace_from = 0;
+	u64  m_trace_to   = ~u64(0);
+	u64  m_ctrace_from = 0;
+	u64  m_ctrace_to   = ~u64(0);
+	bool m_brk_gated_enabled = false;    // --brk-gated: start disabled
+	bool m_brk_gated_active = false;     // toggled by guest TraceCtl pokes
+	std::vector<u16> m_brks;
+	u16  m_trace_task_tcb = 0xffff;      // 0xffff = no filter
+	bool m_trace_procs = false;
+	// usim main_picothing.cpp hardcoded UniFLEX kernel hook addresses.
+	static constexpr u16 UNIFLEX_FORK_PC = 0x789E;
+	static constexpr u16 UNIFLEX_EXEC_PC = 0x75F0;
+	static constexpr u16 UNIFLEX_EXIT_PC = 0x79AA;
+	static constexpr u16 UNIFLEX_UTASK   = 0xBF5B;  // current TCB pointer (BE)
+	// Boundary-detect state for the AS_OPCODES tap.
+	u16  m_last_fetch_addr = 0xffff;
+	bool m_first_fetch = true;
+	u64  m_inst_count = 0;
 };
 
 // BREAK snippet — copied to $FFE0-$FFEF when the watchpoint is armed.
@@ -734,19 +765,26 @@ void picothing_state::swp_trigger(u16 offending_addr)
 
 void picothing_state::tracectl_w(u8 data)
 {
+	// TraceCtl encoding (matches usim's tracectl.h byte-for-byte):
+	//   $00 — disable trace AND --brk-gated
+	//   $01 — enable --brk-gated (firmware lets the brk list fire)
+	//   $02 — enable --brk-gated + trace
+	// Anything else: log as a marker if trace is on.
 	switch (data)
 	{
 	case 0x00:
 		m_trace_enabled = false;
+		m_brk_gated_active = false;
 		break;
 	case 0x01:
-		m_trace_enabled = true;
-		logerror("TraceCtl: enabled at PC=%04X (task=%u)\n",
+		m_brk_gated_active = true;
+		logerror("TraceCtl: brk-gated ON at PC=%04X (task=%u)\n",
 			m_maincpu->pc(), unsigned(m_dat_task));
 		break;
 	case 0x02:
 		m_trace_enabled = true;
-		logerror("TraceCtl: verbose at PC=%04X task=%u A=%02X B=%02X X=%04X Y=%04X U=%04X S=%04X\n",
+		m_brk_gated_active = true;
+		logerror("TraceCtl: trace+brk ON at PC=%04X task=%u A=%02X B=%02X X=%04X Y=%04X U=%04X S=%04X\n",
 			m_maincpu->pc(), unsigned(m_dat_task),
 			m_maincpu->state_int(M6809_A), m_maincpu->state_int(M6809_B),
 			m_maincpu->state_int(M6809_X), m_maincpu->state_int(M6809_Y),
@@ -1016,6 +1054,201 @@ void picothing_state::instrumentation_emit_cycles()
 		std::fprintf(fp, "%llu\n", (unsigned long long)cur_cycles());
 		std::fclose(fp);
 	}
+}
+
+
+//------------------------------------------------------------
+// Stage D: instruction-level trace + breakpoints
+//
+// AS_OPCODES read taps fire on every opcode-space byte fetch. To
+// identify instruction boundaries without modifying the m6809 core,
+// we use a boundary heuristic: an addr that is NOT the previous
+// addr + 1 (or 2 — to allow a single prefix byte) is the first byte
+// of a new instruction. Combined with reading the CPU's state PC
+// register inside the tap, this catches every instruction without
+// firing for operand bytes.
+//
+// --trace                   per-instruction line on stderr
+// --trace-from=N --trace-to=N        instruction-windowed
+// --ctrace-from=M --ctrace-to=M      cycle-windowed
+// --brk=ADDR[,ADDR,...]     register dump on PC match
+// --brk-gated               brk starts off; $FFCB poke flips it
+// --trace-task=ADDR         filter to one active UniFLEX TCB
+// --trace-procs             log at UniFLEX fork/exec/exit hooks
+//------------------------------------------------------------
+
+u64 picothing_state::parse_u64_env(const char *env, u64 dflt)
+{
+	if (!env || !*env) return dflt;
+	char *end = nullptr;
+	unsigned long long const v = std::strtoull(env, &end, 0);
+	return (end == env) ? dflt : u64(v);
+}
+
+std::vector<u16> picothing_state::parse_addr_csv(const char *env) const
+{
+	std::vector<u16> out;
+	if (!env || !*env) return out;
+	std::string cur;
+	auto flush = [&]()
+	{
+		if (cur.empty()) return;
+		char *end = nullptr;
+		unsigned long const v = std::strtoul(cur.c_str(), &end, 0);
+		if (end != cur.c_str() && v < 0x10000) out.push_back(u16(v));
+		cur.clear();
+	};
+	for (const char *p = env; *p; p++)
+	{
+		if (*p == ',' || *p == ';') flush();
+		else cur.push_back(*p);
+	}
+	flush();
+	return out;
+}
+
+void picothing_state::emit_register_dump(const char *prefix, u16 pc)
+{
+	std::fprintf(stderr,
+		"%s cycle=%llu pc=$%04X task=%u A=$%02X B=$%02X DP=$%02X "
+		"X=$%04X Y=$%04X U=$%04X S=$%04X CC=$%02X\n",
+		prefix,
+		(unsigned long long)cur_cycles(),
+		unsigned(pc),
+		unsigned(m_dat_task),
+		unsigned(m_maincpu->state_int(M6809_A) & 0xff),
+		unsigned(m_maincpu->state_int(M6809_B) & 0xff),
+		unsigned(m_maincpu->state_int(M6809_DP) & 0xff),
+		unsigned(m_maincpu->state_int(M6809_X) & 0xffff),
+		unsigned(m_maincpu->state_int(M6809_Y) & 0xffff),
+		unsigned(m_maincpu->state_int(M6809_U) & 0xffff),
+		unsigned(m_maincpu->state_int(M6809_S) & 0xffff),
+		unsigned(m_maincpu->state_int(M6809_CC) & 0xff));
+}
+
+bool picothing_state::task_filter_matches(u16 target_tcb) const
+{
+	if (target_tcb == 0xffff) return true;   // no filter
+	// utask is a BE 16-bit pointer at $BF5B in the fixed window. Read
+	// non-perturbingly via peek_logical.
+	u16 const cur = (u16(peek_logical(UNIFLEX_UTASK)) << 8)
+				  | u16(peek_logical(UNIFLEX_UTASK + 1));
+	return cur == target_tcb;
+}
+
+void picothing_state::trace_procs_hook(u16 pc)
+{
+	const char *label = nullptr;
+	if      (pc == UNIFLEX_FORK_PC) label = "fork";
+	else if (pc == UNIFLEX_EXEC_PC) label = "exec";
+	else if (pc == UNIFLEX_EXIT_PC) label = "exit";
+	if (!label) return;
+	u16 const utask = (u16(peek_logical(UNIFLEX_UTASK)) << 8)
+					| u16(peek_logical(UNIFLEX_UTASK + 1));
+	std::fprintf(stderr, "PROCS %s cycle=%llu pc=$%04X task=%u utask=$%04X\n",
+		label, (unsigned long long)cur_cycles(),
+		unsigned(pc), unsigned(m_dat_task), unsigned(utask));
+}
+
+void picothing_state::on_instruction(u16 pc)
+{
+	m_inst_count++;
+
+	// Task filter: if set, suppress both trace and brk when the
+	// active utask TCB doesn't match.
+	bool const task_ok = task_filter_matches(m_trace_task_tcb);
+
+	// Breakpoint check.
+	if (task_ok)
+	{
+		bool const brk_active = m_brk_gated_enabled ? m_brk_gated_active : true;
+		if (brk_active && !m_brks.empty())
+		{
+			for (u16 b : m_brks)
+			{
+				if (b == pc)
+				{
+					emit_register_dump("BRK", pc);
+					// brk also fires --dump regions for context.
+					instrumentation_dump_all("brk");
+					break;
+				}
+			}
+		}
+	}
+
+	// Trace check: respect --trace, --brk-gated trace-mode (set by
+	// TraceCtl $02 poke), --trace-from/to instruction window, and
+	// --ctrace-from/to cycle window.
+	bool trace_active = m_trace_user_enabled || m_trace_enabled;
+	if (trace_active)
+	{
+		if (m_inst_count < m_trace_from || m_inst_count > m_trace_to)
+			trace_active = false;
+	}
+	if (trace_active)
+	{
+		u64 const cyc = cur_cycles();
+		if (cyc < m_ctrace_from || cyc > m_ctrace_to)
+			trace_active = false;
+	}
+	if (trace_active && task_ok)
+		emit_register_dump("TRACE", pc);
+
+	// Procs hooks (UniFLEX kernel fork/exec/exit).
+	if (m_trace_procs && task_ok)
+		trace_procs_hook(pc);
+}
+
+void picothing_state::install_trace_opcode_tap()
+{
+	// Parse env vars.
+	if (std::getenv("PICOTHING_TRACE")) m_trace_user_enabled = true;
+	m_trace_from = parse_u64_env(std::getenv("PICOTHING_TRACE_FROM"), 0);
+	m_trace_to   = parse_u64_env(std::getenv("PICOTHING_TRACE_TO"),   ~u64(0));
+	m_ctrace_from = parse_u64_env(std::getenv("PICOTHING_CTRACE_FROM"), 0);
+	m_ctrace_to   = parse_u64_env(std::getenv("PICOTHING_CTRACE_TO"),   ~u64(0));
+	m_brks = parse_addr_csv(std::getenv("PICOTHING_BRK"));
+	if (std::getenv("PICOTHING_BRK_GATED")) m_brk_gated_enabled = true;
+	if (const char *tt = std::getenv("PICOTHING_TRACE_TASK"))
+	{
+		char *end = nullptr;
+		unsigned long const v = std::strtoul(tt, &end, 0);
+		if (end != tt && v < 0x10000) m_trace_task_tcb = u16(v);
+	}
+	if (std::getenv("PICOTHING_TRACE_PROCS")) m_trace_procs = true;
+
+	// Short-circuit: nothing to do?
+	bool const any_trace = m_trace_user_enabled
+		|| m_brk_gated_enabled || !m_brks.empty() || m_trace_procs;
+	if (!any_trace)
+		return;
+
+	// The m6809 in MAME fetches opcodes via AS_PROGRAM (no separate
+	// AS_OPCODES space is wired up by this driver). Install a read
+	// tap and trigger on each new PC value — MAME's m6809 advances
+	// the state PC after every byte fetched, so this fires once per
+	// memory cycle (byte-granular trace), not strictly once per
+	// instruction. Brk hits and trace-procs hooks still fire at
+	// exact PC matches, which is what the user-facing semantics
+	// require.
+	logerror("picothing trace: installing AS_PROGRAM read tap "
+		"(trace=%d brk_gated=%d brks=%u trace_procs=%d trace_task=$%04X)\n",
+		int(m_trace_user_enabled), int(m_brk_gated_enabled),
+		unsigned(m_brks.size()), int(m_trace_procs),
+		unsigned(m_trace_task_tcb));
+
+	address_space &ops = m_maincpu->space(AS_PROGRAM);
+	ops.install_read_tap(0x0000, 0xffff, "picothing_trace",
+		[this](offs_t /*addr*/, u8 &/*data*/, u8 /*mask*/)
+		{
+			u16 const pc = cur_pc();
+			if (pc == m_last_fetch_addr && !m_first_fetch)
+				return;
+			m_last_fetch_addr = pc;
+			m_first_fetch = false;
+			on_instruction(pc);
+		});
 }
 
 
@@ -1347,6 +1580,9 @@ void picothing_state::machine_start()
 	// and install non-perturbing memory taps. Must come AFTER cart
 	// distribution so peek_logical reads the post-load values.
 	install_instrumentation_taps();
+
+	// Stage D: instruction-level trace + breakpoints.
+	install_trace_opcode_tap();
 
 	// At exit, run all --dump regions and emit the cycle count.
 	machine().add_notifier(MACHINE_NOTIFY_EXIT,
