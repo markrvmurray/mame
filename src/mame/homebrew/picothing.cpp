@@ -12,17 +12,28 @@
 //
 // Memory map (top-to-bottom — $0000 at the top, $FFFF at the bottom):
 //
-//   $0000-$FDFF   DAT-translated RAM (2 MB physical, 8 KB pages)
+//   $0000-$DFFF   DAT-translated RAM (2 MB physical, 8 KB pages, 32 tasks)
+//   $E000-$FDFF   Fixed never-remapped window into physical page $FF
+//                 ($1FE000-$1FFDFF — the last 8 KB of the 2 MB store).
+//                 Hardware bypasses the DAT table for this range; the
+//                 board ROM and OS-9 use it for cross-task globals.
 //   $FE00-$FEFF   DAT page table (256 bytes — 32 tasks × 8 entries)
-//   $FF00-$FF09   PATA IDE controller (file-backed disk image)
-//   $FFC0         DAT task register (writes set the 5-bit active task)
+//   $FF00-$FF09   PATA IDE controller (file-backed disk image; multi-sector)
+//   $FFC0         DAT task register (writes set the 5-bit active task;
+//                                    reads return the current task number)
 //   $FFC4-$FFC5   Console MC6850 ACIA (status, data)
 //   $FFC6-$FFC7   Auxiliary MC6850 ACIA (null peer — discards TX)
-//   $FFC8-$FFC9   50 Hz tick timer ($FFC8 = ctrl, $FFC9 = status)
+//   $FFC8-$FFC9   PicoTick (cycle-driven 50 Hz default; PICOTHING_TICK env)
 //   $FFCA         SystemWatchpoint control register
 //   $FFCB         TraceCtl (program-controlled host-side logging toggle)
-//   $FFD0-$FFDF   FRAM (16 bytes, file-backed; SHARED area)
-//   $FFE0-$FFFF   SystemWatchpoint vector + snippet shadow
+//   $FFD0-$FFDF   FRAM SHARED area (16 bytes, file-backed)
+//   $FFE0-$FFFF   SystemWatchpoint vector + snippet shadow (also file-backed
+//                 via the same .fram file — bytes 16..47 of the 48-byte file)
+//
+// DAT-table entry value $FF is a "page unavailable" sentinel; any guest
+// access through a $FF entry asserts NMI and the read returns $FF / the
+// write is dropped. Tasks must not place $FF in their DAT table; the
+// fixed window at $E000-$FDFF references physical page $FF directly.
 //
 // Unlike `llvm6309`, this driver has no halt port — Pico-Thing firmware
 // has no host-exit mechanism. The emulator runs until interrupted,
@@ -93,7 +104,7 @@ private:
 	static constexpr u32 DAT_PHYS_SIZE    = 2 * 1024 * 1024;
 
 	static constexpr u32 FRAM_BASE        = 0xFFD0;
-	static constexpr u32 FRAM_SIZE        = 0x0010;
+	static constexpr u32 FRAM_SIZE        = 0x0010;     // SHARED area only
 
 	static constexpr u16 SWP_WINDOW_BASE  = 0xFFE0;
 	static constexpr u16 SWP_WINDOW_SIZE  = 0x0020;
@@ -101,11 +112,26 @@ private:
 	static constexpr u16 SWP_SNIPPET_LEN  = 0x10;
 	static const u8 SWP_BREAK_SNIPPET[SWP_SNIPPET_LEN];
 
-	// PicoTick: 50 Hz at 1 MHz E clock = 20000 cycles per tick. The
-	// MAME tick is driven from a periodic emu_timer at 50 Hz; the
-	// cycles approach matches usim but isn't faithful in real time
-	// here, and 50 Hz wall-clock is what firmware actually depends on.
-	static constexpr unsigned PICOTICK_HZ = 50;
+	// On-disk FRAM is SHARED (16) + vector-shadow (32) = 48 bytes,
+	// matching usim09pt's persistent backing. The vector-shadow bytes
+	// at file offset 16..47 are tee'd through from m_swp_shadow on
+	// every shadow mutation (arm / disarm / write).
+	static constexpr u32 FRAM_FILE_SIZE   = FRAM_SIZE + SWP_WINDOW_SIZE;
+
+	// PicoTick: default 50 Hz = 20000 cycles at 1 MHz E. PICOTHING_TICK
+	// env var overrides for tick-rate sweeps (matches usim's --tick=N).
+	// The emu_timer fires at attotime::from_ticks(N, cpu_clock) which is
+	// equivalent to N CPU cycles at the constant 1 MHz E rate.
+	static constexpr unsigned PICOTICK_DEFAULT_PERIOD = 20000;
+
+	// Fixed never-remapped window: $E000-$FDFF -> physical page $FF
+	// (last 8KB of the 2MB store at $1FE000-$1FFDFF). Board logic
+	// hardwires this — accesses bypass the DAT table entirely. The
+	// DAT-table value $FF is reserved as a "page unavailable" sentinel
+	// (any access through it traps NMI).
+	static constexpr u32 DAT_FIXED_WINDOW_BASE = 0xE000;
+	static constexpr u32 DAT_FIXED_PHYS_BASE   = 0x1FE000;
+	static constexpr u8  DAT_PAGE_UNAVAILABLE  = 0xFF;
 
 	void mem_map(address_map &map) ATTR_COLD;
 
@@ -114,7 +140,9 @@ private:
 	void dat_w(offs_t offset, u8 data);
 	u8   dat_table_r(offs_t offset);
 	void dat_table_w(offs_t offset, u8 data);
+	u8   picotask_r();
 	void picotask_w(u8 data);
+	void dat_unavailable_trap(offs_t offset, u8 page_idx, bool is_write);
 
 	// PicoTick
 	u8   picotick_r(offs_t offset);
@@ -134,6 +162,7 @@ private:
 	void ide_do_write();
 	void ide_do_identify();
 	void ide_complete_write();
+	void ide_advance_lba();
 	u32  ide_get_lba() const;
 
 	// SystemWatchpoint
@@ -166,6 +195,7 @@ private:
 	// PicoTick state
 	u8 m_tick_ctrl = 0;
 	u8 m_tick_status = 0;
+	u32 m_tick_period = PICOTICK_DEFAULT_PERIOD;
 	emu_timer *m_tick_timer = nullptr;
 
 	// FRAM state
@@ -180,6 +210,7 @@ private:
 	u8 m_ide_error = 0;
 	u8 m_ide_features = 0;
 	u8 m_ide_sector_count = 1;
+	u16 m_ide_sectors_remaining = 0;     // 0=256 expansion already applied
 	u8 m_ide_lba_low = 0;
 	u8 m_ide_lba_mid = 0;
 	u8 m_ide_lba_high = 0;
@@ -223,20 +254,57 @@ const u8 picothing_state::SWP_BREAK_SNIPPET[SWP_SNIPPET_LEN] = {
 // DAT MMU
 //------------------------------------------------------------
 
+void picothing_state::dat_unavailable_trap(offs_t offset, u8 page_idx, bool is_write)
+{
+	// usim memory.h: DAT-table entry $FF is the "page unavailable"
+	// sentinel — any access through it asserts NMI so the firmware
+	// can detect bad page references. Reads return $FF, writes drop.
+	logerror("DAT: page-unavailable %s at $%04X (task=%u page_idx=$%02X)\n",
+		is_write ? "write" : "read",
+		offset, unsigned(m_dat_task), page_idx);
+	m_maincpu->set_input_line(INPUT_LINE_NMI, ASSERT_LINE);
+}
+
 u8 picothing_state::dat_r(offs_t offset)
 {
+	// Fixed never-remapped window: $E000-$FDFF -> physical page $FF
+	// (last 8 KB of the 2 MB store at $1FE000-$1FFDFF). Hardware
+	// enforces this; the DAT table is not consulted for this range.
+	if (offset >= DAT_FIXED_WINDOW_BASE)
+	{
+		return m_dat_phys[DAT_FIXED_PHYS_BASE + (offset - DAT_FIXED_WINDOW_BASE)];
+	}
+
 	// 5-bit task selects 8 entries of the 256-byte page table.
 	// Each entry is a 1-byte physical-page index (0-255 → 8 KB chunks
 	// of the 2 MB physical store).
 	u8 const page_idx = (m_dat_task << 3) | (offset >> 13);
-	u32 const phys = (u32(m_dat_table[page_idx]) << 13) | (offset & 0x1FFF);
+	u8 const phys_page = m_dat_table[page_idx];
+	if (phys_page == DAT_PAGE_UNAVAILABLE)
+	{
+		dat_unavailable_trap(offset, page_idx, false);
+		return 0xFF;
+	}
+	u32 const phys = (u32(phys_page) << 13) | (offset & 0x1FFF);
 	return m_dat_phys[phys];
 }
 
 void picothing_state::dat_w(offs_t offset, u8 data)
 {
+	if (offset >= DAT_FIXED_WINDOW_BASE)
+	{
+		m_dat_phys[DAT_FIXED_PHYS_BASE + (offset - DAT_FIXED_WINDOW_BASE)] = data;
+		return;
+	}
+
 	u8 const page_idx = (m_dat_task << 3) | (offset >> 13);
-	u32 const phys = (u32(m_dat_table[page_idx]) << 13) | (offset & 0x1FFF);
+	u8 const phys_page = m_dat_table[page_idx];
+	if (phys_page == DAT_PAGE_UNAVAILABLE)
+	{
+		dat_unavailable_trap(offset, page_idx, true);
+		return;     // store is dropped
+	}
+	u32 const phys = (u32(phys_page) << 13) | (offset & 0x1FFF);
 	m_dat_phys[phys] = data;
 }
 
@@ -249,6 +317,14 @@ void picothing_state::dat_table_w(offs_t offset, u8 data)
 {
 	if (offset < DAT_TABLE_SIZE)
 		m_dat_table[offset] = data;
+}
+
+u8 picothing_state::picotask_r()
+{
+	// usim: PicoTask reads return the current task number. Firmware
+	// pokes the read register to learn which context is active
+	// (required by NitrOS-9 SWICall).
+	return m_dat_task;
 }
 
 void picothing_state::picotask_w(u8 data)
@@ -330,11 +406,18 @@ void picothing_state::fram_load()
 	if (m_fram_path.empty())
 		return;
 	FILE *fp = std::fopen(m_fram_path.c_str(), "rb");
-	if (fp)
-	{
+	if (!fp)
+		return;
+	std::fseek(fp, 0, SEEK_END);
+	long const sz = std::ftell(fp);
+	std::fseek(fp, 0, SEEK_SET);
+	// Backward-compat: 16-byte files (old MAME format) load only SHARED;
+	// 48-byte files (matches usim09pt) load SHARED + vector shadow.
+	if (sz >= long(FRAM_SIZE))
 		(void)std::fread(m_fram, 1, FRAM_SIZE, fp);
-		std::fclose(fp);
-	}
+	if (sz >= long(FRAM_FILE_SIZE))
+		(void)std::fread(m_swp_shadow, 1, SWP_WINDOW_SIZE, fp);
+	std::fclose(fp);
 }
 
 void picothing_state::fram_save()
@@ -342,11 +425,11 @@ void picothing_state::fram_save()
 	if (m_fram_path.empty())
 		return;
 	FILE *fp = std::fopen(m_fram_path.c_str(), "wb");
-	if (fp)
-	{
-		(void)std::fwrite(m_fram, 1, FRAM_SIZE, fp);
-		std::fclose(fp);
-	}
+	if (!fp)
+		return;
+	(void)std::fwrite(m_fram, 1, FRAM_SIZE, fp);
+	(void)std::fwrite(m_swp_shadow, 1, SWP_WINDOW_SIZE, fp);
+	std::fclose(fp);
 }
 
 
@@ -370,6 +453,8 @@ void picothing_state::ide_do_read()
 		m_ide_error = 0x04;
 		return;
 	}
+	// usim picoide.cpp:84-85: sector_count==0 means 256 sectors.
+	m_ide_sectors_remaining = m_ide_sector_count ? m_ide_sector_count : 256;
 	long const offset = long(ide_get_lba()) * 512;
 	std::fseek(m_ide_disk, offset, SEEK_SET);
 	size_t n = std::fread(m_ide_buffer, 1, 512, m_ide_disk);
@@ -377,15 +462,26 @@ void picothing_state::ide_do_read()
 		std::memset(m_ide_buffer + n, 0, 512 - n);
 	m_ide_buf_ptr = 0;
 	m_ide_writing = false;
+	m_ide_sectors_remaining--;
 	m_ide_status = IDE_SR_DRDY | IDE_SR_DRQ;
 }
 
 void picothing_state::ide_do_write()
 {
+	m_ide_sectors_remaining = m_ide_sector_count ? m_ide_sector_count : 256;
 	std::memset(m_ide_buffer, 0, sizeof(m_ide_buffer));
 	m_ide_buf_ptr = 0;
 	m_ide_writing = true;
 	m_ide_status = IDE_SR_DRDY | IDE_SR_DRQ;
+}
+
+void picothing_state::ide_advance_lba()
+{
+	u32 const lba = ide_get_lba() + 1;
+	m_ide_lba_low  = u8(lba & 0xff);
+	m_ide_lba_mid  = u8((lba >> 8) & 0xff);
+	m_ide_lba_high = u8((lba >> 16) & 0xff);
+	m_ide_drive_head = (m_ide_drive_head & 0xf0) | u8((lba >> 24) & 0x0f);
 }
 
 void picothing_state::ide_complete_write()
@@ -400,8 +496,21 @@ void picothing_state::ide_complete_write()
 	std::fseek(m_ide_disk, offset, SEEK_SET);
 	(void)std::fwrite(m_ide_buffer, 1, 512, m_ide_disk);
 	std::fflush(m_ide_disk);
-	m_ide_writing = false;
-	m_ide_status = IDE_SR_DRDY;
+	if (m_ide_sectors_remaining > 0)
+		m_ide_sectors_remaining--;
+	if (m_ide_sectors_remaining > 0)
+	{
+		// Advance LBA and prep buffer for next sector — DRQ stays set.
+		ide_advance_lba();
+		std::memset(m_ide_buffer, 0, sizeof(m_ide_buffer));
+		m_ide_buf_ptr = 0;
+		m_ide_status = IDE_SR_DRDY | IDE_SR_DRQ;
+	}
+	else
+	{
+		m_ide_writing = false;
+		m_ide_status = IDE_SR_DRDY;
+	}
 }
 
 void picothing_state::ide_do_identify()
@@ -443,8 +552,24 @@ u8 picothing_state::ide_r(offs_t offset)
 			m_ide_buf_ptr += 2;
 			if (m_ide_buf_ptr >= 512)
 			{
-				m_ide_status &= ~IDE_SR_DRQ;
-				m_ide_status |= IDE_SR_DRDY;
+				// usim picoide.cpp: multi-sector READ — if more sectors
+				// remain, advance LBA and refill the buffer; DRQ stays set.
+				if (m_ide_sectors_remaining > 0 && m_ide_disk && !m_ide_writing)
+				{
+					ide_advance_lba();
+					long const off = long(ide_get_lba()) * 512;
+					std::fseek(m_ide_disk, off, SEEK_SET);
+					size_t n = std::fread(m_ide_buffer, 1, 512, m_ide_disk);
+					if (n < 512)
+						std::memset(m_ide_buffer + n, 0, 512 - n);
+					m_ide_buf_ptr = 0;
+					m_ide_sectors_remaining--;
+				}
+				else
+				{
+					m_ide_status &= ~IDE_SR_DRQ;
+					m_ide_status |= IDE_SR_DRDY;
+				}
 			}
 			return v;
 		}
@@ -529,6 +654,7 @@ void picothing_state::swp_vec_w(offs_t offset, u8 data)
 		return;
 	}
 	m_swp_shadow[offset] = data;
+	fram_save();    // tee through to persistent FRAM backing
 }
 
 void picothing_state::swp_arm()
@@ -541,6 +667,7 @@ void picothing_state::swp_arm()
 	m_swp_shadow[SWP_NMI_OFFSET]     = u8(SWP_WINDOW_BASE >> 8);
 	m_swp_shadow[SWP_NMI_OFFSET + 1] = u8(SWP_WINDOW_BASE & 0xff);
 	m_swp_armed = true;
+	fram_save();
 }
 
 void picothing_state::swp_disarm()
@@ -550,6 +677,7 @@ void picothing_state::swp_disarm()
 		m_swp_shadow[SWP_NMI_OFFSET]     = m_swp_saved_nmi_hi;
 		m_swp_shadow[SWP_NMI_OFFSET + 1] = m_swp_saved_nmi_lo;
 		m_swp_armed = false;
+		fram_save();
 	}
 	m_maincpu->set_input_line(INPUT_LINE_NMI, CLEAR_LINE);
 }
@@ -835,9 +963,19 @@ void picothing_state::machine_start()
 	for (u32 i = 0; i < DAT_TABLE_SIZE; i++)
 		m_dat_table[i] = u8(i);
 
-	// 50 Hz tick timer.
+	// Cycle-driven 50 Hz tick. PICOTHING_TICK env var overrides the
+	// default 20000 cycles per tick (matches usim's --tick=N). At the
+	// constant 1 MHz E clock, from_ticks(N, clock) is exactly N CPU
+	// cycles between fires — equivalent to usim's instruction-cycle
+	// counter for this fixed-clock device.
+	if (const char *tick_env = std::getenv("PICOTHING_TICK"))
+	{
+		long const n = std::strtol(tick_env, nullptr, 0);
+		m_tick_period = (n > 0) ? u32(n) : PICOTICK_DEFAULT_PERIOD;
+	}
 	m_tick_timer = timer_alloc(FUNC(picothing_state::picotick_fire), this);
-	m_tick_timer->adjust(attotime::from_hz(PICOTICK_HZ), 0, attotime::from_hz(PICOTICK_HZ));
+	attotime const period = attotime::from_ticks(m_tick_period, m_maincpu->clock());
+	m_tick_timer->adjust(period, 0, period);
 
 	// FRAM persistence — env-var path with a sensible default.
 	const char *fram_env = std::getenv("PICOTHING_FRAM_FILE");
@@ -888,6 +1026,7 @@ void picothing_state::machine_start()
 	save_item(NAME(m_dat_task));
 	save_item(NAME(m_tick_ctrl));
 	save_item(NAME(m_tick_status));
+	save_item(NAME(m_tick_period));
 	save_item(NAME(m_fram));
 	save_item(NAME(m_ide_buffer));
 	save_item(NAME(m_ide_buf_ptr));
@@ -895,6 +1034,7 @@ void picothing_state::machine_start()
 	save_item(NAME(m_ide_error));
 	save_item(NAME(m_ide_features));
 	save_item(NAME(m_ide_sector_count));
+	save_item(NAME(m_ide_sectors_remaining));
 	save_item(NAME(m_ide_lba_low));
 	save_item(NAME(m_ide_lba_mid));
 	save_item(NAME(m_ide_lba_high));
@@ -926,7 +1066,7 @@ void picothing_state::mem_map(address_map &map)
 	map(0x0000, 0xfdff).rw(FUNC(picothing_state::dat_r), FUNC(picothing_state::dat_w));
 	map(0xfe00, 0xfeff).rw(FUNC(picothing_state::dat_table_r), FUNC(picothing_state::dat_table_w));
 	map(0xff00, 0xff09).rw(FUNC(picothing_state::ide_r), FUNC(picothing_state::ide_w));
-	map(0xffc0, 0xffc0).w(FUNC(picothing_state::picotask_w));
+	map(0xffc0, 0xffc0).rw(FUNC(picothing_state::picotask_r), FUNC(picothing_state::picotask_w));
 	map(0xffc4, 0xffc5).rw(m_acia_con, FUNC(acia6850_device::read), FUNC(acia6850_device::write));
 	map(0xffc6, 0xffc7).rw(m_acia_aux, FUNC(acia6850_device::read), FUNC(acia6850_device::write));
 	map(0xffc8, 0xffc9).rw(FUNC(picothing_state::picotick_r), FUNC(picothing_state::picotick_w));
