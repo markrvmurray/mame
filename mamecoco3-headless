@@ -1,0 +1,272 @@
+#!/bin/sh
+# license:BSD-3-Clause
+# copyright-holders:Mark Murray
+#
+# Headless wrapper for the coco3 subtarget on macOS.
+#
+# Usage:
+#   ./mamecoco3-headless [FLAGS] [timeout-seconds]
+#   ./mamecoco3-headless --debug[=PORT] [FLAGS]
+#
+# READ THIS FIRST — the CoCo 3 is not like llvm6309 / picothing.
+#
+# Those two are SBCs whose console IS a 6850 ACIA, so "headless" means
+# "pipe the ACIA to stdout" and the capture is total. A CoCo 3 has no
+# such thing: its console is the GIME video screen plus the keyboard
+# matrix, and a stock NitrOS-9 Level 2 talks to /term, which is that
+# screen. There is no serial stream to redirect. So this wrapper gives
+# you three partial views instead of one complete one, and you pick the
+# one that suits the thing you are testing:
+#
+#   1. FINAL SCREENSHOT (always). MAME's -seconds_to_run writes a PNG of
+#      each screen as it tears down (src/emu/video.cpp:989). This is the
+#      honest answer to "did NitrOS-9 reach a shell prompt" — the path is
+#      printed to stderr at exit. It is a picture, so it needs eyes or an
+#      image diff, not grep.
+#
+#   2. BIT-BANGER SERIAL (--bitb, on by default). The CoCo's 4-pin DIN
+#      serial port hangs off PIA1 PA1/PB0 and is wired here to a
+#      null_modem. Whatever the guest sends to /p — or to a bit-banger
+#      term driver, if your boot disk has one — lands on stdout. 600 baud
+#      by default on a CoCo 3, which is the hardware's choice, not ours.
+#
+#   3. DRIVEWIRE / BECKER (--becker). The virtual Becker port is a TCP
+#      socket to a DriveWire server on 127.0.0.1. With NitrOS-9's
+#      term_becker as /term this is a REAL headless console, and it is
+#      the closest the CoCo 3 gets to what picothing gives you for free.
+#      It needs a DriveWire server already listening before you start —
+#      this wrapper does not spawn one.
+#
+# ROMs: the CoCo 3 needs coco3.rom (Tandy/Microsoft, copyrighted, not in
+# this repo) under roms/. Without it MAME refuses to start. Check with
+#   ./mamecoco3 -verifyroms coco3
+#
+# Exit status: 124 on a clean run to the -seconds_to_run cap, matching
+# the GNU timeout(1) convention the other two wrappers use. A CoCo 3 has
+# no halt port, so reaching the cap IS the normal, successful path.
+#
+# Flags:
+#   -1 FILE  --flop1=FILE    floppy drive 0 (.dsk .dmk .jvc .vdk .os9 ...)
+#   -2 FILE  --flop2=FILE    floppy drive 1
+#   --hd1=FILE --hd2=FILE    CoCo Virtual Hard Disk (.vhd)
+#   --cart=FILE              ROM cartridge image (.ccc / .rom)
+#   --ext=SLOT               cartridge slot device (default: fdc)
+#                            ./mamecoco3 -listslots coco3 lists them all
+#   --machine=NAME           coco3 (default), coco3h (HD6309), coco3p
+#                            (PAL), dragon64, coco2b, ...
+#   --becker[=PORT]          enable the Becker port (default TCP 65504)
+#   --bitb=FILE              keep the bit-banger capture at FILE instead
+#                            of a temp file (still echoed to stdout)
+#   --no-bitb                do not wire the serial port at all
+#   --snap=DIR               snapshot directory (default: ./snap)
+#   --no-snap                suppress the final screenshot
+#   --keep-cfg               keep the generated cfg dir (debugging aid)
+#   --debug[=PORT]           gdbstub on PORT (default 2159), no time cap
+#   --                       pass everything after this to MAME verbatim
+
+set -e
+
+here=$(dirname "$0")
+
+# ---------- defaults ----------
+machine=coco3
+ext=fdc
+flop1=
+flop2=
+hd1=
+hd2=
+cart=
+becker=0
+becker_port=65504
+bitb_file=
+use_bitb=1
+snap_dir=
+use_snap=1
+keep_cfg=0
+debug_mode=0
+debug_port=2159
+timeout=
+passthru=
+
+# ---------- arg parsing ----------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -1)                shift; flop1="$1" ;;
+        --flop1=*)         flop1="${1#--flop1=}" ;;
+        -2)                shift; flop2="$1" ;;
+        --flop2=*)         flop2="${1#--flop2=}" ;;
+        --hd1=*)           hd1="${1#--hd1=}" ;;
+        --hd2=*)           hd2="${1#--hd2=}" ;;
+        --cart=*)          cart="${1#--cart=}" ;;
+        --ext=*)           ext="${1#--ext=}" ;;
+        --machine=*)       machine="${1#--machine=}" ;;
+        --becker)          becker=1 ;;
+        --becker=*)        becker=1; becker_port="${1#--becker=}" ;;
+        --bitb=*)          bitb_file="${1#--bitb=}"; use_bitb=1 ;;
+        --no-bitb)         use_bitb=0 ;;
+        --snap=*)          snap_dir="${1#--snap=}" ;;
+        --no-snap)         use_snap=0 ;;
+        --keep-cfg)        keep_cfg=1 ;;
+        --debug)           debug_mode=1 ;;
+        --debug=*)         debug_mode=1; debug_port="${1#--debug=}" ;;
+        --)                shift; passthru="$*"; break ;;
+        -h|--help)
+            sed -n '5,70p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        -*)
+            echo "mamecoco3-headless: unknown flag '$1'" >&2
+            echo "try --help, or put MAME flags after a '--' separator" >&2
+            exit 2
+            ;;
+        *)
+            # First bare word is the timeout; anything after that is an
+            # error rather than a silently-ignored argument.
+            if [ -z "$timeout" ]; then
+                timeout="$1"
+            else
+                echo "mamecoco3-headless: unexpected argument '$1'" >&2
+                exit 2
+            fi
+            ;;
+    esac
+    shift
+done
+
+timeout="${timeout:-30}"
+snap_dir="${snap_dir:-${here}/snap}"
+
+# ---------- sanity ----------
+if [ ! -x "${here}/mamecoco3" ]; then
+    echo "mamecoco3-headless: ${here}/mamecoco3 not built." >&2
+    echo "  make SUBTARGET=coco3 REGENIE=1 -j\$(sysctl -n hw.ncpu)" >&2
+    exit 2
+fi
+
+for f in "$flop1" "$flop2" "$hd1" "$hd2" "$cart"; do
+    if [ -n "$f" ] && [ ! -f "$f" ]; then
+        echo "mamecoco3-headless: no such image: $f" >&2
+        exit 2
+    fi
+done
+
+# ---------- temp state ----------
+tmp_bitb=
+cfg_dir=
+cleanup() {
+    [ -n "$tmp_bitb" ] && rm -f "$tmp_bitb"
+    if [ -n "$cfg_dir" ] && [ "$keep_cfg" -eq 0 ]; then rm -rf "$cfg_dir"; fi
+    return 0
+}
+trap cleanup EXIT
+
+if [ "$use_bitb" -eq 1 ] && [ -z "$bitb_file" ]; then
+    tmp_bitb=$(mktemp /tmp/coco3_bitb.XXXXXX)
+    bitb_file="$tmp_bitb"
+fi
+
+# ---------- becker port ----------
+#
+# The Becker port is a PORT_CONFNAME configuration switch, not a slot or
+# a command-line option, so it cannot be set with a flag. MAME only ever
+# reads it from the per-system cfg file. We generate a throwaway cfg dir
+# containing exactly that one setting and point -cfg_directory at it, so
+# the user's real cfg/ is left alone.
+#
+# The XML shape mirrors ioport_manager::save_game_inputs()
+# (src/emu/ioport.cpp:2896) — tag/type/mask/defvalue identify the field,
+# value overrides it. CONFIG_VERSION is 10 (src/emu/config.h:47); if a
+# future MAME bumps it, MAME warns and ignores the file, and --becker
+# silently stops working. That is the one fragile thing in here.
+cfg_args=""
+if [ "$becker" -eq 1 ]; then
+    cfg_dir=$(mktemp -d /tmp/coco3_cfg.XXXXXX)
+    cat > "${cfg_dir}/${machine}.cfg" <<CFGEOF
+<?xml version="1.0"?>
+<mameconfig version="10">
+    <system name="${machine}">
+        <input>
+            <port tag=":beckerport" type="CONFIG" mask="1" defvalue="0" value="1" />
+            <port tag=":dwsock:drivewire_port" type="CONFIG" mask="65535" defvalue="65504" value="${becker_port}" />
+        </input>
+    </system>
+</mameconfig>
+CFGEOF
+    cfg_args="-cfg_directory ${cfg_dir}"
+    echo "mamecoco3-headless: Becker port on, DriveWire server expected at 127.0.0.1:${becker_port}" >&2
+fi
+
+# ---------- build the media argument list ----------
+set -- "$machine" -ext "$ext"
+[ -n "$flop1" ] && set -- "$@" -flop1 "$flop1"
+[ -n "$flop2" ] && set -- "$@" -flop2 "$flop2"
+[ -n "$hd1" ]   && set -- "$@" -hard1 "$hd1"
+[ -n "$hd2" ]   && set -- "$@" -hard2 "$hd2"
+[ -n "$cart" ]  && set -- "$@" -cart "$cart"
+[ "$use_bitb" -eq 1 ] && set -- "$@" -rs232 null_modem -bitb "$bitb_file"
+
+if [ "$use_snap" -eq 1 ]; then
+    mkdir -p "$snap_dir"
+    set -- "$@" -snapshot_directory "$snap_dir"
+fi
+
+# ---------- common headless flags ----------
+# -video none still ticks the screen device, so the final snapshot is a
+# real frame and not a blank one; it just never reaches a window.
+set -- "$@" \
+    -video none \
+    -sound none \
+    -window \
+    -nothrottle \
+    -keyboardprovider none \
+    -mouseprovider none \
+    -lightgunprovider none \
+    -joystickprovider none \
+    -midiprovider none \
+    -skip_gameinfo \
+    -noplugins \
+    -uifontprovider none
+
+# ---------- run ----------
+rc=0
+if [ "$debug_mode" -eq 1 ]; then
+    echo "mamecoco3 listening for gdb-RSP on localhost:${debug_port}" >&2
+    echo "  execution is PAUSED until a client attaches" >&2
+    # shellcheck disable=SC2086
+    env SDL_VIDEO_DRIVER=dummy "${here}/mamecoco3" "$@" \
+        -debugger gdbstub \
+        -debugger_host localhost \
+        -debugger_port "$debug_port" \
+        -debug \
+        $cfg_args $passthru || rc=$?
+else
+    # shellcheck disable=SC2086
+    env SDL_VIDEO_DRIVER=dummy "${here}/mamecoco3" "$@" \
+        -debugger none \
+        -seconds_to_run "$timeout" \
+        $cfg_args $passthru || rc=$?
+fi
+
+# ---------- report ----------
+if [ "$use_bitb" -eq 1 ] && [ -s "$bitb_file" ]; then
+    cat "$bitb_file"
+fi
+
+if [ "$use_snap" -eq 1 ] && [ "$debug_mode" -eq 0 ]; then
+    # open_next() picks the lowest free NNNN, so the run's own snapshot
+    # is the newest file rather than a predictable name.
+    latest=$(ls -t "${snap_dir}/${machine}"/*.png 2>/dev/null | head -1)
+    if [ -n "$latest" ]; then
+        echo "mamecoco3-headless: final screen -> $latest" >&2
+    else
+        echo "mamecoco3-headless: no snapshot written (did MAME start?)" >&2
+    fi
+fi
+
+# MAME's own failure (bad ROM, missing image) must not be laundered into
+# the 124 "ran to the cap" status — that is a pass, and this is not.
+if [ "$rc" -ne 0 ]; then
+    exit "$rc"
+fi
+[ "$debug_mode" -eq 1 ] && exit 0
+exit 124

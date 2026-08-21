@@ -1,0 +1,40 @@
+// license:BSD-3-Clause
+// copyright-holders:Mark Murray
+//
+// Driver list for the coco3 subtarget — the Tandy Color Computer
+// family, primarily the CoCo 3 for NitrOS-9 Level 2 work.
+//
+// coco12.cpp and dragon.cpp are compiled in regardless (coco3_state
+// derives from coco_state, and the cartridge slot-option function
+// lives in coco12.cpp), so registering their machines here costs
+// nothing beyond these lines.
+
+@source:trs/coco3.cpp
+coco3           // CoCo 3, NTSC, MC6809E
+coco3h          // CoCo 3, NTSC, HD6309
+coco3p          // CoCo 3, PAL,  MC6809E
+msm3            // Prologica CP-400 Color II / MSM-3
+
+@source:trs/coco12.cpp
+coco            // CoCo 1
+cocoh           // CoCo 1, HD6309
+coco2b          // CoCo 2B
+coco2bh         // CoCo 2B, HD6309
+cd6809
+cp400
+cp400c2
+deluxecoco
+lzcolor64
+ms1600
+mx1600
+t4426
+
+@source:trs/dragon.cpp
+dragon32
+dragon64
+dragon64h       // HD6309
+dragon200
+dragon200e
+d64plus
+tanodr64
+tanodr64h       // HD6309

@@ -3,15 +3,21 @@
 Personal notes for this MAME fork. The `MRVM` suffix marks documents that are
 mine and are not part of upstream MAME.
 
-Two custom homebrew drivers live here:
+Three subtargets live here — two custom homebrew drivers and one scoped
+build of upstream code:
 
-| Driver       | Purpose                                                            |
+| Subtarget    | Purpose                                                            |
 |--------------|--------------------------------------------------------------------|
 | `llvm6309`   | Headless HD6309 SBC for `llvm-mc6809` backend lit execution tests  |
 | `picothing`  | Pico-Thing MC6809 SBC emulator (DAT MMU, IDE, FRAM, dual ACIA)     |
+| `coco3`      | Tandy Color Computer 3 (+ CoCo 1/2, Dragon) for NitrOS-9 Level 2   |
 
-Both drivers share the same IO layout in the `$FFCx` zone so a debug-build
-firmware can target either without an `#ifdef`. The split is:
+`coco3` contains **no forked driver code** — it is upstream's
+`src/mame/trs/` compiled behind a narrow token list. Only the subtarget
+`.lua`, the `.lst` and the headless wrapper are ours.
+
+The two homebrew drivers share the same IO layout in the `$FFCx` zone so a
+debug-build firmware can target either without an `#ifdef`. The split is:
 
 - `llvm6309` is intentionally minimal — flat 64 KB RAM, one ACIA, watchpoint,
   halt port. No MMU, no IDE, no FRAM. Optimised for fast lit-test turnaround.
@@ -22,7 +28,8 @@ firmware can target either without an `#ifdef`. The split is:
 
 Both layouts mirror the `usim` reference emulators (`usim09batch` and
 `usim09pt` next door in `../usim`) so the same test programs run unchanged
-across emulators.
+across emulators. `coco3` shares none of this — it is stock hardware, not
+a harness.
 
 ## `llvm6309` — HD6309 SBC for llvm-mc6809 backend validation
 
@@ -249,9 +256,120 @@ The bytes are distributed:
 - Pico-Thing firmware has no halt port. Use `-seconds_to_run` (or a
   SystemWatchpoint trap) to terminate.
 
-## The RS-232 workaround (shared by both subtargets)
+## `coco3` — Tandy Color Computer 3
 
-`BUSES["RS232"] = true` is intentionally NOT set in either subtarget. If it
+A scoped build of upstream's CoCo/Dragon drivers, added to boot and
+exercise NitrOS-9 Level 2 on real GIME hardware semantics. Unlike the
+other two this is not a simulator built for the LLVM backend — it is the
+reference machine NitrOS-9 actually targets, so it answers "does this
+behave on a real CoCo 3" rather than "does this instruction sequence
+execute correctly".
+
+### What is registered
+
+24 machines, all from three upstream sources:
+
+- `trs/coco3.cpp` — `coco3` (NTSC), `coco3h` (HD6309), `coco3p` (PAL), `msm3`
+- `trs/coco12.cpp` — `coco`, `cocoh`, `coco2b`, `coco2bh`, `cp400`, `t4426`, …
+- `trs/dragon.cpp` — `dragon32`, `dragon64`, `dragon64h`, `tanodr64`, …
+
+`coco12.cpp` and `dragon.cpp` are compiled in whether or not they are
+registered — `coco3_state` derives from `coco_state`, and the cartridge
+slot-option function lives in `coco12.cpp` — so listing their machines
+costs `.lst` lines and nothing else. The `coco3h` / `cocoh` / `dragon64h`
+HD6309 variants are a useful cross-check against `llvm6309`.
+
+### ROMs
+
+**Not in this repo and not obtainable from it.** `coco3` needs
+`coco3.rom` (Tandy/Microsoft Super Extended Color BASIC) and, because the
+default cartridge is the floppy controller, `disk11.rom`. Put them under
+`roms/` and check with:
+
+```sh
+./mamecoco3 -verifyroms coco3
+```
+
+Without them MAME exits with "Required files are missing" before the
+machine ever starts.
+
+### Build
+
+```sh
+make SUBTARGET=coco3 REGENIE=1 -j$(sysctl -n hw.ncpu)
+```
+
+Output binary: `./mamecoco3` (~81 MB). This subtarget is much fatter than
+the other two — see `BUILDING.md` ("Why `coco3` is the fat one") for the
+cascade that causes it and the recipe for fixing the link errors an
+upstream merge will eventually produce.
+
+### Running
+
+```sh
+./mamecoco3 coco3 -flop1 nitros9_l2.dsk          # interactive, with a window
+./mamecoco3-headless -1 nitros9_l2.dsk 30        # scripted
+```
+
+Useful media and slot options (`-listmedia` / `-listslots` for the rest):
+
+| Option              | Meaning                                                     |
+|---------------------|-------------------------------------------------------------|
+| `-flop1` / `-flop2` | Floppy drives 0 and 1 (`.dsk .dmk .jvc .vdk .os9` …)         |
+| `-hard1` / `-hard2` | CoCo Virtual Hard Disk (`.vhd`) — NitrOS-9 hard disk         |
+| `-cart`             | ROM cartridge image (`.ccc` / `.rom`)                        |
+| `-ext`              | Cartridge slot device; defaults to `fdc`, also `multi`, `ide`, `rs232` |
+
+### Headless capture — read this before scripting it
+
+The CoCo 3 is **not** like `llvm6309` / `picothing`. Those are SBCs whose
+console *is* a 6850 ACIA, so headless capture is total: the ACIA goes to
+stdout and nothing is lost. A CoCo 3 has no such port. Its console is the
+GIME video screen plus the keyboard matrix, and a stock NitrOS-9 Level 2
+talks to `/term`, which is that screen. **There is no serial stream to
+redirect.**
+
+`mamecoco3-headless` therefore offers three partial views rather than one
+complete one:
+
+| View | Flag | What you get | Limitation |
+|------|------|--------------|------------|
+| Final screenshot | on by default | PNG of the GIME screen at the `-seconds_to_run` cap, written by `src/emu/video.cpp:989`. Path printed to stderr. | It is a picture — needs eyes or an image diff, not `grep` |
+| Bit-banger serial | on by default | The 4-pin DIN port (PIA1 PA1/PB0) wired to a `null_modem`, echoed to stdout. Catches `/p` output, or a bit-banger term driver if your boot disk has one | 600 baud on a CoCo 3; not the console unless you make it so |
+| DriveWire / Becker | `--becker[=PORT]` | A real headless console when the boot disk uses NitrOS-9's `term_becker` as `/term` | Needs a DriveWire server already listening on 127.0.0.1; the wrapper does not spawn one |
+
+The Becker port is a `PORT_CONFNAME` configuration switch, not a slot or a
+command-line option, so it cannot be set with a flag. `--becker` works by
+generating a throwaway cfg directory holding just that one setting and
+pointing `-cfg_directory` at it, leaving the real `cfg/` alone. The XML
+shape mirrors `ioport_manager::save_game_inputs()`
+(`src/emu/ioport.cpp:2896`) and hard-codes `CONFIG_VERSION` 10
+(`src/emu/config.h:47`). **If an upstream merge bumps that constant, MAME
+warns and ignores the file and `--becker` silently stops working** — that
+is the one fragile thing in the wrapper.
+
+Exit status is 124 on a clean run to the cap, matching the GNU
+`timeout(1)` convention the other wrappers use. A CoCo 3 has no halt port,
+so reaching the cap *is* the normal successful path; a non-124 status
+means MAME itself failed (missing ROM, bad image) and is not laundered
+into a pass.
+
+### Files
+
+| Path                                | Purpose                                  |
+|-------------------------------------|------------------------------------------|
+| `scripts/target/mame/coco3.lua`     | GENie subtarget — token list + file list |
+| `src/mame/coco3.lst`                | Driver list                               |
+| `mamecoco3-headless`                | Headless wrapper                          |
+
+No driver source of ours; everything compiled comes from upstream
+`src/mame/trs/`.
+
+## The RS-232 workaround (`llvm6309` and `picothing` only)
+
+`BUSES["RS232"] = true` is intentionally NOT set in either of those two
+subtargets. **`coco3` does not and cannot use this workaround** — see the
+note at the end of this section. If it
 were, `bus/rs232/rs232.cpp`'s `default_rs232_devices()` would drag every
 terminal card (`heath_h19`, `ie15`, `mboardd`, `scorpion`, `sun_kbd`,
 `swtpc8212`, `terminal`, `votraxtnt`) into the link, transitively pulling in
@@ -274,6 +392,12 @@ Instead:
 
 If upstream's `rs232.cpp` bus-core API changes, `llvm6309_rs232_core.cpp`
 must be kept in sync (~130 lines, doesn't change often).
+
+`coco3` is excluded from all of this. Its drivers are upstream's, so it
+cannot supply its own slot-option function — and one of the CoCo cartridge
+cards (`coco_rs232.cpp`) includes `bus/rs232/rs232.h` directly, so the
+stripped core would buy nothing even if it could. `coco3` sets
+`BUSES["RS232"] = true` and absorbs the full terminal-card cascade.
 
 ## Not upstream
 

@@ -45,6 +45,8 @@
 !/mamellvm6309-headless
 # MRVM: headless-run wrapper for the picothing subtarget (see README_MRVM.md)
 !/mamepicothing-headless
+# MRVM: headless-run wrapper for the coco3 subtarget (see README_MRVM.md)
+!/mamecoco3-headless
 # MRVM: cart-image wrapper used by lit / picolibc (see README_MRVM.md, bug #194)
 !/run-mc6809-mame
 /.idea

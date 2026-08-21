@@ -1,9 +1,13 @@
 # Building this fork's MC6809 / HD6309 simulators
 
-This fork carries two homebrew drivers, `llvm6309` (HD6309) and `picothing`
-(MC6809E, Pico-Thing SBC), used as simulators for validating
-[`llvm-mc6809`](https://github.com/mrvmurray/llvm-mc6809) and its picolibc
-port. Both are built as **GENie subtargets** so they compile only the code
+This fork carries three subtargets. Two are homebrew drivers, `llvm6309`
+(HD6309) and `picothing` (MC6809E, Pico-Thing SBC), used as simulators for
+validating [`llvm-mc6809`](https://github.com/mrvmurray/llvm-mc6809) and its
+picolibc port. The third, `coco3`, is a scoped build of upstream's Tandy
+Color Computer drivers for NitrOS-9 Level 2 work — no forked driver code,
+just a narrower compile.
+
+All three are built as **GENie subtargets** so they compile only the code
 they actually need — anything broken in the rest of upstream MAME
 (`src/mame/<other-manufacturer>/`) literally cannot fail this fork's build,
 because it never enters the compile.
@@ -13,15 +17,19 @@ because it never enters the compile.
 ```sh
 make SUBTARGET=llvm6309  REGENIE=1 -j$(sysctl -n hw.ncpu)
 make SUBTARGET=picothing REGENIE=1 -j$(sysctl -n hw.ncpu)
+make SUBTARGET=coco3     REGENIE=1 -j$(sysctl -n hw.ncpu)
 ```
 
 - **`REGENIE=1`** is mandatory on the first build, after editing the
   subtarget's `.lua`, and any time you switch between subtargets. Without
   it GENie reuses cached project files that point at the *previous*
   subtarget's source list, and your changes vanish silently.
-- Output binaries: `./mamellvm6309` and `./mamepicothing` (each ~70 MB).
-- Build time on Apple Silicon: ~2–5 minutes once `3rdparty/` is cached
-  (vs ~30+ minutes for a full `make` of MAME).
+- Output binaries: `./mamellvm6309`, `./mamepicothing` (each ~70 MB) and
+  `./mamecoco3` (~81 MB).
+- Build time on Apple Silicon: ~2–5 minutes for the two homebrew drivers
+  once `3rdparty/` is cached (vs ~30+ minutes for a full `make` of MAME).
+  `coco3` is longer — it compiles several hundred extra device sources,
+  for the reason given under "Why `coco3` is the fat one" below.
 - Link RAM: a few GB (vs ~30 GB for full MAME).
 
 Prerequisites on macOS: `brew install sdl3 pkg-config`. If pkg-config is
@@ -54,6 +62,35 @@ instead of the default `mame.lua`, and to `src/mame/<name>.lst` instead of
 - The driver source (`llvm6309.cpp` or `picothing.cpp`), the local
   stripped `llvm6309_rs232_core.cpp` (replaces the full `rs232.cpp` bus
   core — see `README_MRVM.md` for why), and `null_modem.cpp`.
+- **`coco3`** is the exception to all of the above — it whitelists around
+  sixty tokens rather than four. See below.
+
+### Why `coco3` is the fat one
+
+The other two subtargets keep their scope small by having the driver
+supply its own RS-232 slot-option function, so the bus core links without
+dragging in every terminal card ever written. `coco3` cannot do that: the
+slot-option functions it needs (`coco_cart_add_basic_devices()` and
+friends) are called from **upstream** `src/mame/trs/coco12.cpp`, which
+`coco3` shares as a base class. Stripping them would mean patching an
+upstream file and carrying that patch across every rebase — worse than a
+big link.
+
+So `BUSES["COCO"]` goes in whole, and it cascades: the cartridge bus wants
+the ATA, BBC-userport, Centronics, MIDI and RS-232 buses, each of which
+exposes its own "default devices" list naming every card for that bus. The
+result is that a CoCo 3 build contains Heathkit terminals, Epson printer
+mechanisms and a chess sensorboard. They are never instantiated; they just
+have to link.
+
+`scripts/target/mame/coco3.lua` keeps this legible by splitting its token
+list into what the machine actually needs and a clearly-labelled
+transitive-closure block. **When an upstream merge adds a card to one of
+those buses, expect a crop of undefined-vtable link errors.** Resolve them
+mechanically: take the undefined symbol, find its `DEFINE_DEVICE_TYPE`,
+map the header to a token via the `--@` selector comments in
+`scripts/src/{cpu,sound,video,machine,bus,formats}.lua`, and add it to the
+closure block. It took four rounds to converge the first time.
 
 ### Always built regardless of subtarget
 
@@ -103,12 +140,22 @@ After a successful build, each subtarget's driver list should contain
 exactly one entry:
 
 ```sh
-./mamellvm6309   -listxml 2>/dev/null | grep -c '<machine '   # → 1
-./mamepicothing  -listxml 2>/dev/null | grep -c '<machine '   # → 1
+./mamellvm6309   -listfull 2>/dev/null | tail -n +2 | wc -l   # → 1
+./mamepicothing  -listfull 2>/dev/null | tail -n +2 | wc -l   # → 1
+./mamecoco3      -listfull 2>/dev/null | tail -n +2 | wc -l   # → 24
 ```
 
-If you get more than 1, the subtarget is leaking — usually a stray
-entry has crept into the `.lst` file.
+For the two homebrew drivers, more than 1 means the subtarget is leaking —
+usually a stray entry has crept into the `.lst` file. `coco3` deliberately
+registers 24: the CoCo 3 machines plus the CoCo 1/2 and Dragon siblings,
+which are compiled in regardless as base classes and so cost nothing but
+`.lst` lines.
+
+`-validate` is the real gate and passes clean on all three:
+
+```sh
+./mamecoco3 -validate && echo OK
+```
 
 ## Other useful make flags
 
