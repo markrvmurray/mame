@@ -279,6 +279,32 @@ slot-option function lives in `coco12.cpp` — so listing their machines
 costs `.lst` lines and nothing else. The `coco3h` / `cocoh` / `dragon64h`
 HD6309 variants are a useful cross-check against `llvm6309`.
 
+### Running the HD6309 machines
+
+The 6309 machines need no separate build — `CPUS["M6809"]` covers both
+cores, so they are ordinary machines in the same binary:
+
+```sh
+./mamecoco3-headless --machine=coco3h 3      # Hitachi HD6309E, 894886 Hz
+./mamecoco3-headless --machine=dragon64h 3   # DragonDOS on an HD6309E
+```
+
+`coco3h` is a stock CoCo 3 with the CPU swapped — same GIME, same ROM
+(`rom_coco3h` is `#define`d to `rom_coco3`), which is why it boots the
+identical Super Extended Color BASIC image. MAME flags it
+`MACHINE_UNOFFICIAL` because Tandy never shipped it; the 6309 was always
+an aftermarket drop-in. The same holds for `cocoh`, `coco2bh` and
+`dragon64h`.
+
+Like `llvm6309`, these boot in 6809 emulation mode — code wanting the
+6309-only instructions has to execute `LDMD #1` first. The stock ROMs
+never do, since they are the same binaries the 6809 machines run.
+
+`tanodr64h` is registered but does not run: the Color Computer Archive
+set still carries the 2001-era `d64_1.rom` / `d64_2.rom`, while current
+MAME wants the re-dumped `tano_1.ic18` plus `sdtandy.rom` from the
+`sdtandy_fdc` set. The other four verify and boot.
+
 ### ROMs
 
 **Not in this repo and not obtainable from it.** They are Tandy /
@@ -338,7 +364,7 @@ Useful media and slot options (`-listmedia` / `-listslots` for the rest):
 | `-flop1` / `-flop2` | Floppy drives 0 and 1 (`.dsk .dmk .jvc .vdk .os9` …)         |
 | `-hard1` / `-hard2` | CoCo Virtual Hard Disk (`.vhd`) — NitrOS-9 hard disk         |
 | `-cart`             | ROM cartridge image (`.ccc` / `.rom`)                        |
-| `-ext`              | Cartridge slot device; defaults to `fdc`, also `multi`, `ide`, `rs232` |
+| `-ext`              | Cartridge slot device; also `multi`, `ide`, `rs232`. The disk controller is `fdc` on the CoCos but `dragon_fdc` on the Dragons — `mamecoco3-headless` picks the right one from `--machine` |
 
 ### Headless capture — read this before scripting it
 

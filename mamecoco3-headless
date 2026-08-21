@@ -50,8 +50,10 @@
 #   -2 FILE  --flop2=FILE    floppy drive 1
 #   --hd1=FILE --hd2=FILE    CoCo Virtual Hard Disk (.vhd)
 #   --cart=FILE              ROM cartridge image (.ccc / .rom)
-#   --ext=SLOT               cartridge slot device (default: fdc)
-#                            ./mamecoco3 -listslots coco3 lists them all
+#   --ext=SLOT               cartridge slot device. Defaults to fdc, or to
+#                            dragon_fdc on the Dragon/Tano machines, which
+#                            do not accept the CoCo name. -listslots lists
+#                            what each machine takes
 #   --machine=NAME           coco3 (default), coco3h (HD6309), coco3p
 #                            (PAL), dragon64, coco2b, ...
 #   --becker[=PORT]          enable the Becker port (default TCP 65504)
@@ -70,7 +72,7 @@ here=$(dirname "$0")
 
 # ---------- defaults ----------
 machine=coco3
-ext=fdc
+ext=
 flop1=
 flop2=
 hd1=
@@ -135,6 +137,18 @@ done
 
 timeout="${timeout:-30}"
 snap_dir="${snap_dir:-${here}/snap}"
+
+# The disk controller is a different cartridge on each machine family and
+# the slot rejects a name it does not know ("Unknown slot option 'fdc' in
+# slot 'ext'"), so the default has to follow --machine rather than being a
+# fixed string. --ext always wins if given; ./mamecoco3 -listslots <machine>
+# lists what a given machine will accept.
+if [ -z "$ext" ]; then
+    case "$machine" in
+        dragon*|tanodr*|d64plus) ext=dragon_fdc ;;
+        *)                       ext=fdc ;;
+    esac
+fi
 
 # ---------- sanity ----------
 if [ ! -x "${here}/mamecoco3" ]; then
