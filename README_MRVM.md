@@ -281,17 +281,37 @@ HD6309 variants are a useful cross-check against `llvm6309`.
 
 ### ROMs
 
-**Not in this repo and not obtainable from it.** `coco3` needs
-`coco3.rom` (Tandy/Microsoft Super Extended Color BASIC) and, because the
-default cartridge is the floppy controller, `disk11.rom`. Put them under
-`roms/` and check with:
+**Not in this repo and not obtainable from it.** They are Tandy /
+Microsoft copyright and have never been freely released, which is why
+`roms/` is gitignored. Two MAME sets are wanted, both available from the
+[Color Computer Archive](https://colorcomputerarchive.com/repo/ROMs/MAME-MESS/)
+or dumpable from your own hardware:
+
+| Set              | Holds                                                         |
+|------------------|---------------------------------------------------------------|
+| `coco3.zip`      | `coco3.rom` (Super Extended Color BASIC) + `disk11.rom`        |
+| `coco_fdc.zip`   | the disk-controller BIOS ROMs, including the becker pair       |
+
+Drop both zips straight into `roms/` — MAME reads set zips directly, no
+need to unpack — and check with:
 
 ```sh
-./mamecoco3 -verifyroms coco3
+./mamecoco3 -verifyroms coco3      # → romset coco3 is good
 ```
 
-Without them MAME exits with "Required files are missing" before the
-machine ever starts.
+The bare minimum to boot is `coco3.rom` plus `disk11.rom`, because the
+default cartridge is the floppy controller. **`coco_fdc.zip` is what
+unlocks the DriveWire console**: it carries `hdbdw3bc3.rom` and
+`hdbdw3bck.rom`, the HDB-DOS becker builds for the CoCo 3 and CoCo 1/2.
+Without them the `hdbk3` / `hdbk12` BIOS options cannot be selected.
+
+Without `coco3.rom` MAME exits with "Required files are missing" before
+the machine ever starts.
+
+Do not try to build the HDB-DOS becker ROMs from the HDB-DOS source in
+ToolShed. That tree is version 1.5 and the ROMs MAME references are 1.4,
+so the checksums cannot be made to match; the 1.5 build also overruns the
+8 KB window by 19 bytes of filler and does not boot once truncated.
 
 ### Build
 
@@ -336,7 +356,7 @@ complete one:
 |------|------|--------------|------------|
 | Final screenshot | on by default | PNG of the GIME screen at the `-seconds_to_run` cap, written by `src/emu/video.cpp:989`. Path printed to stderr. | It is a picture — needs eyes or an image diff, not `grep` |
 | Bit-banger serial | on by default | The 4-pin DIN port (PIA1 PA1/PB0) wired to a `null_modem`, echoed to stdout. Catches `/p` output, or a bit-banger term driver if your boot disk has one | 600 baud on a CoCo 3; not the console unless you make it so |
-| DriveWire / Becker | `--becker[=PORT]` | A real headless console when the boot disk uses NitrOS-9's `term_becker` as `/term` | Needs a DriveWire server already listening on 127.0.0.1; the wrapper does not spawn one |
+| DriveWire / Becker | `--becker[=PORT]` | A real headless console when the boot disk uses NitrOS-9's `term_becker` as `/term`. Verified as far as an HDB-DOS ready prompt | Serving disks needs a DriveWire server listening on 127.0.0.1; the wrapper does not spawn one |
 
 The Becker port is a `PORT_CONFNAME` configuration switch, not a slot or a
 command-line option, so it cannot be set with a flag. `--becker` works by
@@ -346,7 +366,23 @@ shape mirrors `ioport_manager::save_game_inputs()`
 (`src/emu/ioport.cpp:2896`) and hard-codes `CONFIG_VERSION` 10
 (`src/emu/config.h:47`). **If an upstream merge bumps that constant, MAME
 warns and ignores the file and `--becker` silently stops working** — that
-is the one fragile thing in the wrapper.
+pinned version is the remaining brittleness.
+
+The mechanism itself is verified. Booting the becker BIOS twice at equal
+runtime, changing nothing but the flag, gives different results:
+
+```sh
+./mamecoco3-headless 12        -- -ext fdc,bios=hdbk3   # banners, then hangs
+./mamecoco3-headless --becker 12 -- -ext fdc,bios=hdbk3 # reaches the OK prompt
+```
+
+which is direct evidence that the generated cfg is being read and the
+config switch is being flipped. Note what this also shows: HDB-DOS hangs
+because the Becker *port* is disabled, not because no DriveWire server is
+answering — with the port enabled and nothing listening it still reaches a
+ready prompt. Note too that the BIOS is slot-scoped: a bare
+`-bios hdbk3` is rejected with "invalid BIOS, reverting to default" and
+boots stock Disk BASIC instead.
 
 Exit status is 124 on a clean run to the cap, matching the GNU
 `timeout(1)` convention the other wrappers use. A CoCo 3 has no halt port,
