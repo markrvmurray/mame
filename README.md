@@ -1,8 +1,8 @@
-# MAME — `mrvmurray/mame` fork
+# MAME — `markrvmurray/mame` fork
 
 A personal fork of [MAME](https://github.com/mamedev/mame) carrying two
 custom homebrew drivers used as **MC6809 / HD6309 simulators for testing the
-[`llvm-mc6809`](https://github.com/mrvmurray/llvm-mc6809) backend and the
+[`llvm-mc6809`](https://github.com/markrvmurray/llvm-mc6809) backend and the
 companion picolibc port**. Upstream MAME is the host project; the fork
 adds drivers and headless wrappers without touching anything else of
 significance.
@@ -19,8 +19,10 @@ that:
 - counts cycles for the picolibc benchmark ledger,
 - and — for 6309 coverage — runs Hitachi-only instructions natively.
 
-The primary simulator is [`usim09batch`](https://github.com/mrvmurray/usim)
-(MC6809-only). This fork's `llvm6309` driver is its HD6309 counterpart, and
+The primary simulator is `usim09batch`, from
+[`usim`](https://github.com/markrvmurray/usim/tree/pico-thing). It has an
+HD6309 mode too, but MAME is the reference for HD6309 semantics, so this
+fork's `llvm6309` driver is the HD6309 cross-check, and
 the `picothing` driver is a near-faithful emulation of the Pico-Thing SBC
 (the target hardware) used to validate higher-level workloads against the
 same toolchain.

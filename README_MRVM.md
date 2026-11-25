@@ -27,17 +27,18 @@ debug-build firmware can target either without an `#ifdef`. The split is:
   mechanism, so termination is via `-seconds_to_run`.
 
 Both layouts mirror the `usim` reference emulators (`usim09batch` and
-`usim09pt` next door in `../usim`) so the same test programs run unchanged
+`usim09pt`, in
+[`usim`](https://github.com/markrvmurray/usim/tree/pico-thing)) so the same test programs run unchanged
 across emulators. `coco3` shares none of this — it is stock hardware, not
 a harness.
 
 ## `llvm6309` — HD6309 SBC for llvm-mc6809 backend validation
 
 A minimal single-board computer driver added to exercise the
-[`llvm-mc6809`](../llvm-mc6809) backend against real HD6309 semantics. The
-HD6309 counterpart to the existing `usim09batch` headless 6809 simulator —
-`usim09batch` is 6809-only, so the 6309-specific instructions need a separate
-harness.
+[`llvm-mc6809`](https://github.com/markrvmurray/llvm-mc6809) backend against real HD6309 semantics. The
+HD6309 counterpart to the `usim09batch` headless simulator. `usim09batch`
+runs an HD6309 too (`--hd6309`), but MAME is the reference for HD6309
+semantics, so the 6309-specific instructions are checked here as well.
 
 ### Hardware model
 
@@ -167,7 +168,8 @@ A close mirror of the real Pico-Thing hardware: DAT MMU with 2 MB physical
 RAM paged through 8 KB windows, dual MC6850 ACIAs (console + aux), 50 Hz
 tick timer, PATA IDE (file-backed disk image), FRAM (file-backed
 persistence), and the same SystemWatchpoint as `llvm6309`. Tracks the
-`usim09pt` reference emulator (see `../usim/main_picothing.cpp`).
+`usim09pt` reference emulator (see
+[`main_picothing.cpp`](https://github.com/markrvmurray/usim/blob/pico-thing/main_picothing.cpp)).
 
 ### Hardware model
 

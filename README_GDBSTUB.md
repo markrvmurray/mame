@@ -27,7 +27,8 @@ The raw binary offset must match the ELF's lowest LOAD VMA -- $0100 for
 code-only tests, but lower (e.g. $0021) for tests with __directpage data.
 The reset vector is NOT in any ELF LOAD segment and must be written explicitly.
 
-    LLVM=/Users/markmurray/GitHub/llvm-mc6809/llvm/cmake-build-debug-system/bin
+    # a build of https://github.com/markrvmurray/llvm-mc6809
+    LLVM=/path/to/llvm-mc6809/build/bin
     ELF=/path/to/test.elf
 
     # Find lowest LOAD VMA -- byte offset into the 64K cart image
@@ -78,7 +79,7 @@ architecture support:
 
 Use the in-tree lldb, not the system lldb:
 
-    LLDB=/Users/markmurray/GitHub/llvm-mc6809/llvm/cmake-build-debug-system/bin/lldb
+    LLDB=/path/to/llvm-mc6809/build/bin/lldb
     $LLDB path/to/test.elf
     (lldb) gdb-remote localhost:2159
 

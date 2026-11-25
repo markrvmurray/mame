@@ -2,7 +2,7 @@
 
 This fork carries three subtargets. Two are homebrew drivers, `llvm6309`
 (HD6309) and `picothing` (MC6809E, Pico-Thing SBC), used as simulators for
-validating [`llvm-mc6809`](https://github.com/mrvmurray/llvm-mc6809) and its
+validating [`llvm-mc6809`](https://github.com/markrvmurray/llvm-mc6809) and its
 picolibc port. The third, `coco3`, is a scoped build of upstream's Tandy
 Color Computer drivers for NitrOS-9 Level 2 work — no forked driver code,
 just a narrower compile.
