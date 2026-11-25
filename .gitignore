@@ -39,6 +39,8 @@
 !/makefile
 !/mame.doxygen
 !/*.md
+# MRVM: Claude Code's local guide, never committed (overrides !/*.md above)
+/CLAUDE.md
 !/*.bdf
 !/LICENSE
 # MRVM: headless-run wrapper for the llvm6309 subtarget (see README_MRVM.md)
